@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/iframe-common",
+    "crates/iframe-hook",
+    "crates/iframe-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["iFrame contributors"]
+license = "MIT"
+
+[workspace.dependencies]
+windows = { version = "0.61", features = [] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

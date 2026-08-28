@@ -1,0 +1,7 @@
+[package]
+name = "iframe-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+iframe-common = { path = "../iframe-common" }
