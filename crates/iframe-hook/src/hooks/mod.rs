@@ -6,13 +6,19 @@ pub fn install() -> bool {
         crate::log_line("telemetry init failed");
         return false;
     }
-    match unsafe { dxgi::install() } {
+    let ok = match unsafe { dxgi::install() } {
         Ok(()) => true,
         Err(e) => {
             crate::log_line(&format!("dxgi hook install failed: {e}"));
             false
         }
+    };
+    // Publish the state through the shared header — the control app polls it
+    // there (the process-local HOOK_STATE atomic is invisible across processes).
+    if let Some(ring) = crate::telemetry::ring() {
+        ring.set_hook_state(if ok { 1 } else { 2 });
     }
+    ok
 }
 
 /// Best-effort cleanup (process exit makes this mostly moot, but a clean
