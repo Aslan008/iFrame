@@ -13,7 +13,48 @@ fn main() {
         Some("list") => cmd_list(),
         Some("inject") => cmd_inject(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
+        Some("limit") => cmd_limit(&args[1..]),
         _ => print_usage(),
+    }
+}
+
+/// `iframe limit --pid N --fps 40 [--mode vsync|vrr|off] [--refresh HZ]`
+/// Publishes the runtime config into the game's shared header.
+fn cmd_limit(args: &[String]) {
+    use iframe_common::config::RuntimeConfig;
+    use iframe_common::pacer::PacerMode;
+
+    let Some(pid) = arg_value(args, "--pid").and_then(|v| v.parse().ok()) else {
+        eprintln!("limit: --pid <N> required");
+        std::process::exit(2);
+    };
+    let fps: f64 = arg_value(args, "--fps").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let mode = match arg_value(args, "--mode").as_deref() {
+        Some("vrr") => PacerMode::Vrr,
+        Some("off") => PacerMode::Bypass,
+        _ => PacerMode::FixedVsync,
+    };
+    let refresh: f64 = arg_value(args, "--refresh").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let enabled = fps > 0.0 && mode != PacerMode::Bypass;
+
+    let mapping = match sm_host::open(pid) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("limit: {e} (inject first)");
+            std::process::exit(1);
+        }
+    };
+    let cfg = RuntimeConfig {
+        enabled,
+        mode,
+        target_fps: fps,
+        refresh_hz: refresh,
+    };
+    mapping.ring.set_config(&cfg);
+    if enabled {
+        println!("limit set: {:.0} FPS ({mode:?}) for pid {pid}", fps);
+    } else {
+        println!("limiter disabled for pid {pid}");
     }
 }
 
@@ -155,4 +196,5 @@ fn print_usage() {
     println!("  iframe list");
     println!("  iframe inject --pid <N> | --window <title> [--dll <path>]");
     println!("  iframe watch  --pid <N> [--seconds <S>]");
+    println!("  iframe limit  --pid <N> --fps <F> [--mode vsync|vrr|off] [--refresh <Hz>]");
 }

@@ -33,6 +33,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_VREDRAW, SW_HIDE, WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
+use iframe_common::pacer::PacerMode;
+
 use crate::telemetry;
 
 // COM vtable slot indices for IDXGISwapChain / IDXGISwapChain1.
@@ -111,18 +113,43 @@ pub fn uninstall() {
 // Hook bodies (hot path — lock-free, allocation-free, panic-free)
 // ---------------------------------------------------------------------------
 
-/// Pass-through Present with telemetry. M2 will insert the JIT sleep here,
-/// strictly AFTER the real Present has returned.
+/// JIT-paced Present: the real Present executes IMMEDIATELY (the frame is
+/// never held); the sleep happens after it, delaying only the START of the
+/// next frame so it completes just-in-time for its target vblank.
 unsafe extern "system" fn hooked_present(this: *mut c_void, sync_interval: u32, flags: u32) -> i32 {
     let t_start = crate::timing::qpc_now();
+    crate::debug_step("present: enter");
+    let cfg = telemetry::config();
+    crate::debug_step("present: config ok");
+    let active = is_active_swapchain(this);
+    let pacing = active && cfg.enabled && cfg.mode != PacerMode::Bypass;
+    // К1: while pacing, OUR timer owns the timing — the game's VSync wait
+    // inside Present would double-wait. Override to SyncInterval=0 only for
+    // windowed (borderless/flip) swap chains where DWM still composites at
+    // vblank, so no tearing appears; exclusive fullscreen keeps its VSync.
+    let vsync_overridden = pacing && active_is_windowed(this);
+    crate::debug_step("present: windowed ok");
+    let sync = if vsync_overridden { 0 } else { sync_interval };
     let orig = ORIG_PRESENT.load(Ordering::Acquire);
     let hr = if orig.is_null() {
         0x8000_4005u32 as i32 // E_FAIL — trampoline missing, should not happen
     } else {
-        (std::mem::transmute::<*mut c_void, PresentFn>(orig))(this, sync_interval, flags)
+        (std::mem::transmute::<*mut c_void, PresentFn>(orig))(this, sync, flags)
     };
     let t_end = crate::timing::qpc_now();
-    if is_active_swapchain(this) {
+    if pacing {
+        crate::debug_step("paced present: before hint");
+        let hint = crate::vblank::hint();
+        crate::debug_step("paced present: hint ok");
+        let paced = crate::engine::pace(t_start, t_end, &cfg, hint);
+        crate::debug_step("paced present: engine ok");
+        if let Some((release, decision)) = paced {
+            telemetry::record_paced(t_start, t_end, release, &decision, vsync_overridden);
+            crate::debug_step("paced present: telemetry ok");
+            return hr;
+        }
+    }
+    if active {
         telemetry::record_present(t_start, t_end);
     }
     hr
@@ -136,23 +163,83 @@ unsafe extern "system" fn hooked_present1(
     dirty_rects_count: u32,
 ) -> i32 {
     let t_start = crate::timing::qpc_now();
+    let cfg = telemetry::config();
+    let active = is_active_swapchain(this);
+    let pacing = active && cfg.enabled && cfg.mode != PacerMode::Bypass;
+    let vsync_overridden = pacing && active_is_windowed(this);
+    let sync = if vsync_overridden { 0 } else { sync_interval };
     let orig = ORIG_PRESENT1.load(Ordering::Acquire);
     let hr = if orig.is_null() {
         0x8000_4005u32 as i32
     } else {
         (std::mem::transmute::<*mut c_void, Present1Fn>(orig))(
             this,
-            sync_interval,
+            sync,
             flags,
             dirty_rects,
             dirty_rects_count,
         )
     };
     let t_end = crate::timing::qpc_now();
-    if is_active_swapchain(this) {
+    if pacing {
+        let hint = crate::vblank::hint();
+        if let Some((release, decision)) = crate::engine::pace(t_start, t_end, &cfg, hint) {
+            telemetry::record_paced(t_start, t_end, release, &decision, vsync_overridden);
+            return hr;
+        }
+    }
+    if active {
         telemetry::record_present(t_start, t_end);
     }
     hr
+}
+
+/// Cached windowed/exclusive state of the active swap chain (queried once on
+/// the first paced present — COM call, not hot-path safe to repeat).
+fn active_is_windowed(this: *mut c_void) -> bool {
+    use std::sync::atomic::AtomicBool;
+    static WINDOWED: AtomicBool = AtomicBool::new(true);
+    static CHECKED: AtomicBool = AtomicBool::new(false);
+    if !CHECKED.load(Ordering::Relaxed) {
+        let windowed = unsafe { swapchain_is_windowed(this) };
+        crate::debug_step("windowed: checked");
+        WINDOWED.store(windowed, Ordering::Relaxed);
+        CHECKED.store(true, Ordering::Release);
+    }
+    WINDOWED.load(Ordering::Relaxed)
+}
+
+/// `IDXGISwapChain::GetDesc` called MANUALLY through the object's vtable
+/// (slot 12).
+///
+/// IMPORTANT: do NOT construct a `&IDXGISwapChain` wrapper from the raw `this`
+/// pointer with `&*(this as *const IDXGISwapChain)` — the wrapper struct
+/// *contains* the object pointer, so that cast makes its inner field read the
+/// object's first 8 bytes (= the vtable pointer) as if they were the object
+/// pointer. Every COM call through such a wrapper dereferences garbage →
+/// access violation (the exact crash this replaced).
+unsafe fn swapchain_is_windowed(this: *mut c_void) -> bool {
+    // The COM object's first field is the vtable pointer.
+    let vtbl = *(this as *const *mut *mut c_void);
+    if vtbl.is_null() {
+        crate::log_line("swapchain_is_windowed: null vtable");
+        return true;
+    }
+    // IDXGISwapChain vtable: IUnknown(0..2) + IDXGIObject(3..6)
+    // + IDXGIDeviceSubObject(7) + Present(8) GetBuffer(9) SetFullscreenState(10)
+    // GetFullscreenState(11) GetDesc(12) ...
+    let get_desc_raw = *vtbl.add(12);
+    if get_desc_raw.is_null() {
+        return true;
+    }
+    type GetDescFn = unsafe extern "system" fn(*mut c_void, *mut DXGI_SWAP_CHAIN_DESC) -> i32;
+    let mut desc: DXGI_SWAP_CHAIN_DESC = core::mem::zeroed();
+    let hr = std::mem::transmute::<*mut c_void, GetDescFn>(get_desc_raw)(this, &mut desc);
+    if hr < 0 {
+        crate::log_line(&format!("GetDesc failed: {hr:#x}"));
+        return true;
+    }
+    desc.Windowed.as_bool()
 }
 
 #[inline]

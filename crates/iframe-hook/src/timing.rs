@@ -43,8 +43,15 @@ pub struct HighResSleeper {
     timer: HANDLE,
 }
 
+// The waitable timer HANDLE is process-wide and used from the present thread;
+// the raw handle value carries no thread affinity.
+unsafe impl Send for HighResSleeper {}
+unsafe impl Sync for HighResSleeper {}
+
 impl HighResSleeper {
-    pub fn new() -> Option<Self> {
+    /// Infallible: falls back to spin-only waiting if the high-resolution
+    /// timer cannot be created (ancient Windows).
+    pub fn new() -> Self {
         use windows::Win32::System::Threading::{
             CreateWaitableTimerExW, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
         };
@@ -56,32 +63,63 @@ impl HighResSleeper {
                 TIMER_ALL_ACCESS.0,
             )
         }
-        .ok()?;
-        Some(Self { timer: handle })
+        .unwrap_or_default();
+        Self { timer: handle }
     }
 
     /// Sleep until `target_qpc`. Returns immediately if that time has passed.
+    ///
+    /// HARD BOUND: the kernel wait is capped at `remaining + 2 ms` — if the
+    /// timer fails to arm we still wake up and spin the rest. A limiter must
+    /// NEVER hang the game thread.
     pub fn sleep_until(&self, target_qpc: i64) {
-        use windows::Win32::System::Threading::{SetWaitableTimer, WaitForSingleObject};
-        let freq = qpc_frequency();
-        loop {
-            let now = qpc_now();
-            let remaining_us = (target_qpc - now) as f64 * 1_000_000.0 / freq as f64;
-            if remaining_us <= 0.0 {
-                return;
-            }
-            if remaining_us > 600.0 {
-                // Kernel wait for the bulk; keep ~400 µs for the spin.
-                let kernel_us = remaining_us - 400.0;
-                let due_100ns = -((kernel_us * 10.0) as i64); // negative = relative
-                unsafe {
-                    let _ = SetWaitableTimer(self.timer, &due_100ns, 0, None, None, false);
-                    let _ = WaitForSingleObject(self.timer, u32::MAX);
-                }
-            }
-            // Final approach: spin on QPC.
+        if self.timer.is_invalid() {
             spin_until(target_qpc);
             return;
+        }
+        use windows::Win32::System::Threading::{SetWaitableTimer, WaitForSingleObject};
+        let freq = qpc_frequency();
+        let now = qpc_now();
+        let remaining_us = (target_qpc - now) as f64 * 1_000_000.0 / freq as f64;
+        if remaining_us <= 0.0 {
+            return;
+        }
+        if remaining_us > 600.0 {
+            // Kernel wait for the bulk; keep ~400 µs for the spin.
+            let kernel_us = remaining_us - 400.0;
+            let due_100ns = -((kernel_us * 10.0) as i64); // negative = relative
+            // Bounded wait: even if SetWaitableTimer fails or the timer
+            // misfires, we wake up and finish with the spin.
+            let wait_ms = ((kernel_us / 1000.0).ceil() as u64 + 2).min(u32::MAX as u64) as u32;
+            let fired = unsafe {
+                SetWaitableTimer(self.timer, &due_100ns, 0, None, None, false).is_ok()
+                    && WaitForSingleObject(self.timer, wait_ms)
+                        == windows::Win32::Foundation::WAIT_OBJECT_0
+            };
+            if !fired {
+                // Timer misbehaved — spin the remainder (bounded by target).
+                spin_until(target_qpc);
+                return;
+            }
+        }
+        // Final approach: spin on QPC.
+        spin_until(target_qpc);
+    }
+
+    /// Sleep capped at `max_us` microseconds — a safety net against a broken
+    /// schedule sending the game to sleep for seconds.
+    pub fn sleep_until_capped(&self, target_qpc: i64, max_us: f64) {
+        let freq = qpc_frequency();
+        let now = qpc_now();
+        let remaining_us = (target_qpc - now) as f64 * 1_000_000.0 / freq as f64;
+        if remaining_us > max_us {
+            crate::log_line(&format!(
+                "pacing wait capped: requested {remaining_us:.0} µs > {max_us:.0} µs"
+            ));
+            let capped = now + ((max_us * freq as f64 / 1_000_000.0) as i64);
+            self.sleep_until(capped);
+        } else {
+            self.sleep_until(target_qpc);
         }
     }
 }

@@ -8,9 +8,11 @@
 //! * `install()` runs once; a second load of the DLL is a no-op.
 //! * The Present hot path is lock-free: QPC + ring push + trampoline call.
 
+mod engine;
 mod hooks;
 mod telemetry;
 mod timing;
+mod vblank;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use windows::core::BOOL;
@@ -58,6 +60,17 @@ pub fn log_line(msg: &str) {
     let path = std::env::temp_dir().join("iframe_hook.log");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "[{}] {}", std::process::id(), msg);
+    }
+}
+
+/// Fine-grained step logger for debugging the first pacing attempts.
+/// Logs only the first ~40 steps, then goes silent (hot path stays clean).
+pub fn debug_step(msg: &str) {
+    use std::sync::atomic::AtomicU32;
+    static STEPS: AtomicU32 = AtomicU32::new(0);
+    let n = STEPS.fetch_add(1, Ordering::Relaxed);
+    if n < 40 {
+        log_line(&format!("step {n}: {msg}"));
     }
 }
 

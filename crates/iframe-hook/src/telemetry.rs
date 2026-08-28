@@ -13,6 +13,8 @@ use windows::Win32::System::Memory::{
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 
+use iframe_common::config::RuntimeConfig;
+use iframe_common::pacer::PacerDecision;
 use iframe_common::shared_mem::{total_size, SharedRing, TelemetryFrame};
 
 /// Ring capacity in records (power of two). 4096 × 48 B ≈ 197 KiB.
@@ -101,19 +103,58 @@ pub fn init() -> bool {
     }
 }
 
-/// Push one Present record into the ring. Lock-free, allocation-free.
+/// Current runtime config as published by the control app (few atomic loads).
+#[inline]
+pub fn config() -> RuntimeConfig {
+    ring().map(|r| r.config()).unwrap_or_default()
+}
+
+/// Push one pass-through Present record (limiter inert).
 #[inline]
 pub fn record_present(present_start_qpc: i64, present_end_qpc: i64) {
     if let Some(ring) = RING.get() {
         let frame = TelemetryFrame {
             present_start_qpc,
             present_end_qpc,
-            // M1: no pacing yet — the hook releases the game immediately.
             release_qpc: present_end_qpc,
             target_tick_qpc: 0,
             ema_duration_us: 0.0,
             deviation_us: 0.0,
             flags: TelemetryFrame::FLAG_BYPASS,
+            _pad: 0,
+        };
+        ring.push(&frame);
+    }
+}
+
+/// Push one paced Present record with the pacer's stats.
+#[inline]
+pub fn record_paced(
+    present_start_qpc: i64,
+    present_end_qpc: i64,
+    release_qpc: i64,
+    decision: &PacerDecision,
+    vsync_overridden: bool,
+) {
+    if let Some(ring) = RING.get() {
+        let mut flags = 0;
+        if decision.stats.bypass {
+            flags |= TelemetryFrame::FLAG_BYPASS;
+        }
+        if decision.stats.late {
+            flags |= TelemetryFrame::FLAG_LATE;
+        }
+        if vsync_overridden {
+            flags |= TelemetryFrame::FLAG_VSYNC_OVERRIDE;
+        }
+        let frame = TelemetryFrame {
+            present_start_qpc,
+            present_end_qpc,
+            release_qpc,
+            target_tick_qpc: decision.target_tick_qpc,
+            ema_duration_us: decision.stats.ema_duration_us as f32,
+            deviation_us: decision.stats.deviation_us as f32,
+            flags,
             _pad: 0,
         };
         ring.push(&frame);
