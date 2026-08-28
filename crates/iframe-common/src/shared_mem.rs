@@ -17,7 +17,7 @@ pub const SM_VERSION: u32 = 1;
 
 /// One paced frame, as recorded by the hook. 48 bytes.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TelemetryFrame {
     /// Game entered Present (frame N complete).
     pub present_start_qpc: i64,
@@ -73,7 +73,9 @@ pub struct SharedHeader {
     // ---- stats: DLL -> app ----
     pub target_pid: AtomicU32,
     pub dropped: AtomicU64,
-    pub _pad: [u8; 8],
+    /// 0 = initialising, 1 = hooks installed, 2 = init failed.
+    pub hook_state: AtomicU32,
+    pub _pad: [u8; 4],
 }
 
 /// Total mapping size for a given record capacity (power of two).
@@ -114,7 +116,18 @@ impl SharedRing {
         header.head.store(0, Ordering::Release);
         header.tail.store(0, Ordering::Release);
         header.dropped.store(0, Ordering::Release);
+        header.hook_state.store(0, Ordering::Release);
         Some(Self { ptr, len })
+    }
+
+    /// Hook state as published by the injected DLL (0 booting, 1 ready, 2 failed).
+    pub fn hook_state(&self) -> u32 {
+        self.header().hook_state.load(Ordering::Acquire)
+    }
+
+    /// Producer side: publish the hook state (called by the DLL init thread).
+    pub fn set_hook_state(&self, state: u32) {
+        self.header().hook_state.store(state, Ordering::Release);
     }
 
     /// Attach to an already-initialised region (peer process side).

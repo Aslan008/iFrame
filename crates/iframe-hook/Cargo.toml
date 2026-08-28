@@ -5,3 +5,7 @@ edition.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
+
+[dependencies]
+iframe-common = { path = "../iframe-common" }
+windows = { workspace = true }
