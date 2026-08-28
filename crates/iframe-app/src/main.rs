@@ -1,8 +1,11 @@
-//! iframe.exe — control app CLI (M1: inject / watch / list).
-//! The egui UI arrives in M3; the CLI is the automation surface for M1–M2.
+//! iframe.exe — control app: GUI (default) + CLI (inject / watch / limit / list).
 
 mod injector;
+mod live;
+mod profiles;
 mod sm_host;
+mod tray;
+mod ui;
 mod watch;
 
 use std::path::PathBuf;
@@ -10,11 +13,22 @@ use std::path::PathBuf;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        None | Some("ui") => {
+            if let Err(e) = ui::run() {
+                eprintln!("UI exited: {e}");
+                std::process::exit(1);
+            }
+        }
         Some("list") => cmd_list(),
         Some("inject") => cmd_inject(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
         Some("limit") => cmd_limit(&args[1..]),
-        _ => print_usage(),
+        Some("--help") | Some("-h") | Some("help") => print_usage(),
+        Some(other) => {
+            eprintln!("unknown command: {other}\n");
+            print_usage();
+            std::process::exit(2);
+        }
     }
 }
 
