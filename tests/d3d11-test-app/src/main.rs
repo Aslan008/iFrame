@@ -9,20 +9,20 @@
 
 use std::io::Write;
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDeviceAndSwapChain, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, ID3D11Device,
+    D3D11CreateDevice, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, ID3D11Device,
     ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGISwapChain, DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    IDXGIDevice, IDXGIFactory2, IDXGIOutput, IDXGISwapChain1, DXGI_PRESENT,
+    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, DXGI_SCALING_NONE,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_MODE_DESC, DXGI_MODE_SCALING_UNSPECIFIED,
-    DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::Sleep;
@@ -40,6 +40,7 @@ struct Args {
     seconds: Option<u64>,
     width: u32,
     height: u32,
+    tearing: bool,
 }
 
 fn parse_args() -> Args {
@@ -51,6 +52,7 @@ fn parse_args() -> Args {
         seconds: None,
         width: 640,
         height: 360,
+        tearing: false,
     };
     let mut i = 0;
     while i < argv.len() {
@@ -60,6 +62,7 @@ fn parse_args() -> Args {
             "--seconds" => cfg.seconds = get(i + 1).and_then(|v| v.parse().ok()),
             "--width" => cfg.width = get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(640),
             "--height" => cfg.height = get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(360),
+            "--tearing" => cfg.tearing = true,
             _ => {}
         }
         i += 1;
@@ -71,8 +74,8 @@ fn main() {
     let args = parse_args();
     println!("PID={}", std::process::id());
     println!(
-        "d3d11_test_app: {}x{}, vsync={}, cpu_ms={:.2}",
-        args.width, args.height, args.vsync, args.cpu_ms
+        "d3d11_test_app: {}x{}, vsync={}, cpu_ms={:.2}, tearing={}",
+        args.width, args.height, args.vsync, args.cpu_ms, args.tearing
     );
     let _ = std::io::stdout().flush();
     run_window(args);
@@ -119,50 +122,57 @@ fn run_window(args: Args) {
         )
         .expect("CreateWindowExW");
         let _ = ShowWindow(hwnd, SW_SHOW);
+        // Foreground: DWM composes background windows at a throttled rate
+        // (~64 Hz), which would quantize presents regardless of tearing.
+        // A real game runs in the foreground — mirror that here.
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
 
-        let desc = DXGI_SWAP_CHAIN_DESC {
-            BufferDesc: DXGI_MODE_DESC {
-                Width: args.width,
-                Height: args.height,
-                RefreshRate: DXGI_RATIONAL {
-                    Numerator: 0,
-                    Denominator: 0,
-                },
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                ScanlineOrdering: DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED,
-                Scaling: DXGI_MODE_SCALING_UNSPECIFIED,
-            },
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: 2,
-            OutputWindow: hwnd,
-            Windowed: true.into(),
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-            Flags: 0,
-        };
-        let mut device: Option<ID3D11Device> = None;
-        let mut context: Option<ID3D11DeviceContext> = None;
-        let mut swapchain: Option<IDXGISwapChain> = None;
-        D3D11CreateDeviceAndSwapChain(
+        // Modern creation path: the swap chain goes through the factory's
+        // CreateSwapChainForHwnd — exactly what the iFrame factory hook sees.
+        let mut device_opt: Option<ID3D11Device> = None;
+        let mut context_opt: Option<ID3D11DeviceContext> = None;
+        D3D11CreateDevice(
             None::<&windows::Win32::Graphics::Dxgi::IDXGIAdapter>,
             D3D_DRIVER_TYPE_HARDWARE,
             HMODULE::default(),
             D3D11_CREATE_DEVICE_FLAG(0),
             Some(&[D3D_FEATURE_LEVEL_11_0]),
             D3D11_SDK_VERSION,
-            Some(&desc),
-            Some(&mut swapchain),
-            Some(&mut device),
-            None, // pfeaturelevel out
-            Some(&mut context),
+            Some(&mut device_opt),
+            None,
+            Some(&mut context_opt),
         )
-        .expect("D3D11CreateDeviceAndSwapChain");
-        let device = device.expect("device");
-        let context = context.expect("context");
-        let swapchain = swapchain.expect("swapchain");
+        .expect("D3D11CreateDevice");
+        let device = device_opt.expect("device");
+        let context = context_opt.expect("context");
+
+        let dxgi_device: IDXGIDevice = device.cast().expect("cast IDXGIDevice");
+        let adapter = dxgi_device.GetAdapter().expect("GetAdapter");
+        let factory: IDXGIFactory2 = adapter.GetParent().expect("GetParent factory");
+
+        let desc1 = windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1 {
+            Width: args.width,
+            Height: args.height,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            Stereo: false.into(),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            Scaling: DXGI_SCALING_NONE,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+            Flags: if args.tearing {
+                DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+            } else {
+                0
+            },
+        };
+        let swapchain: IDXGISwapChain1 = factory
+            .CreateSwapChainForHwnd(&device, hwnd, &desc1, None, None::<&IDXGIOutput>)
+            .expect("CreateSwapChainForHwnd");
 
         let backbuffer: ID3D11Texture2D = swapchain.GetBuffer(0).expect("GetBuffer");
         let mut rtv: Option<ID3D11RenderTargetView> = None;
