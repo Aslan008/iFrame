@@ -2,3 +2,6 @@ target/
 *.dll
 *.exe
 *.pdb
+ui_screenshot*.png
+ui_stderr.txt
+ui_out.txt

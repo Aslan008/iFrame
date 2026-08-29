@@ -35,6 +35,7 @@ pub struct IFrameApp {
     profiles: Profiles,
     tray: Option<tray::Tray>,
     hotkeys: Option<tray::HotKeys>,
+    tray_tried: bool,
     last_auto_scan: Instant,
 }
 
@@ -58,8 +59,9 @@ impl IFrameApp {
             applied_on_top: false,
             window_visible: true,
             profiles,
-            tray: tray::create_tray().ok(),
-            hotkeys: tray::create_hotkeys().ok(),
+            tray: None,  // created lazily on the first ui() frame (see below)
+            hotkeys: None,
+            tray_tried: false,
             last_auto_scan: Instant::now() - Duration::from_secs(10),
         };
         app.refresh_windows();
@@ -305,6 +307,15 @@ impl eframe::App for IFrameApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Lazy tray/hotkey init: by the first ui() frame the winit event loop
+        // is pumping messages, so the tray's hidden window is serviced
+        // reliably. Creating them before the loop raced it (one-shot crash).
+        if !self.tray_tried {
+            self.tray_tried = true;
+            self.tray = tray::create_tray().ok();
+            self.hotkeys = tray::create_hotkeys().ok();
+        }
+
         let attached_pid = self.state.attached_pid.load(Ordering::Relaxed);
 
         egui::Panel::top("header").show(ui, |ui| {

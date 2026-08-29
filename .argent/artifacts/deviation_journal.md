@@ -44,11 +44,25 @@
 
 6. **Диагностический протокол:** Event Log (Application, Id=1000) даёт код исключения + сбойный модуль + RVA — это быстрее гаданий; пошаговый debug_step в хуке локализует краш за один прогон.
 
+## 2026-08-29 · M3
+
+1. **eframe 0.36 — полностью новый App-трейт:** главного метода больше нет `update(ctx, frame)` — теперь `fn ui(&mut self, ui: &mut egui::Ui, frame)` (приложение получает Ui напрямую) + отдельный `fn logic(&mut self, ctx, frame)` для контекстных операций (viewport-команды, репейнт, поллинг трея). Панели: `TopBottomPanel` удалён → единый `egui::Panel::top/bottom(...).show(&mut Ui, ...)` — панели теперь принимают `&mut Ui`, а не `&Context`.
+
+2. **СТАРТОВЫЙ КРАШ UI (одноразовый, найден скриншот-бисекцией):** создание tray-icon + global-hotkey в конструкторе приложения (до старта winit event loop) → AV c0000005 в iframe.exe при первом запуске; второй запуск с тем же бинарём — стабилен. Исправлено: ленивая инициализация трея/хоткеев на первом кадре `ui()`, когда event loop уже качает сообщения и скрытое окно трея обслуживается. Урок: Win32-объекты с собственными окнами сообщений (tray, hotkey) создавать только при уже качающемся цикле.
+
+3. **tray-icon 0.24** реэкспортирует muda как `tray_icon::menu`; `Menu::new()`/`MenuItem::new()` без Result (append_items — с Result). **global-hotkey 0.8**: id хоткея — просто `u32` (HotKey::id()), не отдельный тип.
+
+4. **egui_plot 0.37** совместим с egui 0.36 (eframe 0.36) ✓; `LineStyle::Dashed { length }` — вариант энума, не конструктор; `Line::new(name, points)`.
+
+5. **Диагностика молчаливых крашей:** background-хост не захватывает stderr GUI-процессов — редирект `2> файл` внутри команды обязателен; Event Log (Id=1000) даёт сбойный модуль + RVA даже без вывода.
+
+6. **Скриншот-верификация UI:** PowerShell System.Drawing CopyFromScreen → PNG → view_image — визуальное подтверждение рендера (график, оси, пунктирная линия цели, статус-бар, on-top тумблер).
+
 ## Состояние этапов
 - [x] M0 — workspace, pacer.rs (13 unit-тестов ✅), shared_mem.rs (SPSC ✅), DLL-смоук ✅, git init ✅
 - [x] M1 — инъекция ✅, vtable-хук Present@8/Present1@21 ✅, телеметрия ✅, hook_state через shared header ✅
 - [x] M2 — JIT-ядро в DLL ✅: лимит 40 FPS живьём (41.1/39.9/40.2/40.1), каденс Брезенхэма по сетке vblank (DWM 240 Гц), override SyncInterval (К1, только windowed), отключение → возврат 64.3 FPS, процесс жив, 13/13 тестов ✅
-- [ ] M3 — UI (egui, график, трей, профили)
+- [x] M3 — UI ✅: egui-окно (график 10с + линия цели, статистика FPS/p50/p99/late, слайдер+пресеты FPS, режимы ZeroLag/VRR/Off, vsync override), трей (показать/скрыть, toggle, quit), глобальный хоткей Ctrl+Alt+I, профили per-exe в %APPDATA%\iFrame\profiles.toml, авто-аттач известных игр, always-on-top; UI жив 5+ мин, рендер подтверждён скриншотом
 - [ ] M4 — Flip Model: CreateSwapChain*/ResizeBuffers, waitable object (opt-in)
 - [ ] M5 — D3D9 + x86
 - [ ] M6 — ETW «только телеметрия» + чёрный список античитов
