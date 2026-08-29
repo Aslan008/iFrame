@@ -10,7 +10,7 @@ use egui_plot::{Line, Plot, PlotPoints};
 use crate::live::{SharedState, HISTORY_SECONDS};
 use crate::profiles::{GameProfile, Profiles};
 use crate::sm_host::HostMapping;
-use crate::{injector, live, sm_host, tray};
+use crate::{anticheat, etw, injector, live, sm_host, tray};
 use iframe_common::config::RuntimeConfig;
 use iframe_common::pacer::PacerMode;
 
@@ -37,6 +37,8 @@ pub struct IFrameApp {
     hotkeys: Option<tray::HotKeys>,
     tray_tried: bool,
     last_auto_scan: Instant,
+    /// Telemetry-only ETW session (anti-cheat protected targets).
+    etw_watch: Option<etw::EtwWatch>,
 }
 
 impl IFrameApp {
@@ -63,6 +65,7 @@ impl IFrameApp {
             hotkeys: None,
             tray_tried: false,
             last_auto_scan: Instant::now() - Duration::from_secs(10),
+            etw_watch: None,
         };
         app.refresh_windows();
         app
@@ -73,6 +76,22 @@ impl IFrameApp {
     fn attach(&mut self, pid: u32) {
         if self.attached {
             self.detach();
+        }
+        // M6 safety gate: the anti-cheat check runs BEFORE any process access.
+        // Protected targets get the telemetry-only ETW mode instead.
+        if let Err(e) = anticheat::check_process(pid) {
+            log_ui(&format!("{e}"));
+            match etw::start_watch(pid, self.state.clone()) {
+                Ok(w) => {
+                    self.etw_watch = Some(w);
+                    self.attached = true;
+                    self.exe_name = anticheat::process_name(pid).ok();
+                    self.state.attached_pid.store(pid, Ordering::Relaxed);
+                    log_ui("telemetry-only ETW mode active (no injection)");
+                }
+                Err(e2) => log_ui(&format!("ETW telemetry-only failed: {e2}")),
+            }
+            return;
         }
         let mapping = match sm_host::create_for_pid(pid) {
             Ok(m) => m,
@@ -120,6 +139,9 @@ impl IFrameApp {
     }
 
     fn detach(&mut self) {
+        if let Some(mut w) = self.etw_watch.take() {
+            w.stop();
+        }
         self.state.attached_pid.store(0, Ordering::Relaxed);
         if let Some(mapping) = &self.mapping {
             let cfg = RuntimeConfig {

@@ -1,5 +1,7 @@
 //! iframe.exe — control app: GUI (default) + CLI (inject / watch / limit / list).
 
+mod anticheat;
+mod etw;
 mod injector;
 mod live;
 mod profiles;
@@ -22,6 +24,7 @@ fn main() {
         Some("list") => cmd_list(),
         Some("inject") => cmd_inject(&args[1..]),
         Some("watch") => cmd_watch(&args[1..]),
+        Some("watch-etw") => cmd_watch_etw(&args[1..]),
         Some("limit") => cmd_limit(&args[1..]),
         Some("--help") | Some("-h") | Some("help") => print_usage(),
         Some(other) => {
@@ -193,6 +196,46 @@ fn cmd_inject(args: &[String]) {
 
 fn default_dll_path() -> PathBuf {
     PathBuf::from("target/release/iframe_hook.dll")
+}
+
+/// Telemetry-only observation via ETW — no injection, safe for anti-cheat
+/// protected games. Prints live stats until Ctrl+C.
+fn cmd_watch_etw(args: &[String]) {
+    let Some(pid) = arg_value(args, "--pid").and_then(|v| v.parse().ok()) else {
+        eprintln!("watch-etw: --pid <N> required");
+        std::process::exit(2);
+    };
+    let state = live::SharedState::new();
+    state
+        .attached_pid
+        .store(pid, std::sync::atomic::Ordering::Relaxed);
+    let mut watch = match etw::start_watch(pid, state.clone()) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("watch-etw failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "ETW telemetry-only watch on pid {pid} (no injection) — Ctrl+C to stop."
+    );
+    let mut last_total = 0u64;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        let stats = state.stats.lock().unwrap();
+        let recent = stats.total - last_total;
+        last_total = stats.total;
+        println!(
+            "presents: {:5}  fps: {:6.1}  p50: {:7.0} µs",
+            recent,
+            recent as f64 / 2.0,
+            stats.p50_us
+        );
+    }
+    #[allow(unreachable_code)]
+    {
+        watch.stop();
+    }
 }
 
 fn cmd_watch(args: &[String]) {

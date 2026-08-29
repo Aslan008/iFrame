@@ -22,6 +22,8 @@ type ThreadStart = unsafe extern "system" fn(*mut c_void) -> u32;
 
 /// Inject `dll_path` into process `pid` (x64 only in M1).
 pub fn inject(pid: u32, dll_path: &Path) -> Result<(), String> {
+    // M6 safety gate: refuse anti-cheat protected processes outright.
+    crate::anticheat::check_process(pid)?;
     unsafe {
         let process = OpenProcess(
             PROCESS_CREATE_THREAD

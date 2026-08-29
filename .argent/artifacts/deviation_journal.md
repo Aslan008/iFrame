@@ -86,6 +86,18 @@
 
 6. **Диагностический протокол пополнен:** PE-дамп импорт-таблиц Python-скриптом (tests/pe_dump.py) — сравнение файловой таблицы с тем, что видит walk; read-back патченного слота; печать Present-слота игрового девайса из стенда.
 
+## 2026-08-29 · M6
+
+1. **Чёрный список античитов (anticheat.rs):** три уровня — имена сервисов EAC/BattlEye/Vanguard/FACEIT (PROTECTED_PROCESSES), имена модулей, загруженных в целевой процесс (PROTECTED_MODULES — ловит античит в ЛЮБОЙ игре), известные защищённые игры (PROTECTED_GAMES). Проверка check_process(pid) стоит ПЕРВЫМ шагом в injector::inject и в ui::attach — ДО любого доступа к процессу (даже OpenProcess на защищённую игру может быть флагом).
+
+2. **ETW telemetry-only (etw.rs):** real-time сессия на Microsoft-Windows-DxgKrnl (GUID 802ec45a-...) через ferrisetw 1.2.0; Present-события (ID 42/126/168/172/175/184), фильтр по ProcessId-свойству события (ядро логирует под своим PID), frametime из дельт timestamp'ов → общий live-график. Ноль инъекции — безопасно для защищённых игр.
+
+3. **ETW требует прав администратора (0x80070005 «Отказано в доступе»)** — то же требование, что у PresentMon. Код корректен; сообщение об ошибке улучшено с подсказкой «запустите iFrame от администратора». Живой тест не проведён (нужна элевация, UAC-промпты пользователь отклоняет) — ручная проверка: запустить iframe.exe от админа → `watch-etw --pid N`.
+
+4. **UI-fallback:** attach() проверяет античит ДО sm_host::create_for_pid; защищённая цель → автоматический переход в telemetry-only ETW режим (attached=true, exe_name из имени процесса). detach() останавливает ETW-сессию.
+
+5. ** ferrisetw API-заметки:** record.raw_timestamp() -> i64 (не timestamp()); TraceError не реализует Display (использовать {:?}); EventRecord в native/etw_types/event_record.rs; ETW-таймстампы в 100ns единицах (frametime = delta/10 µs).
+
 ## Состояние этапов
 - [x] M0 — workspace, pacer.rs (13 unit-тестов ✅), shared_mem.rs (SPSC ✅), DLL-смоук ✅, git init ✅
 - [x] M1 — инъекция ✅, vtable-хук Present@8/Present1@21 ✅, телеметрия ✅, hook_state через shared header ✅
@@ -93,5 +105,5 @@
 - [x] M3 — UI ✅: egui-окно (график 10с + линия цели, статистика FPS/p50/p99/late, слайдер+пресеты FPS, режимы ZeroLag/VRR/Off, vsync override), трей (показать/скрыть, toggle, quit), глобальный хоткей Ctrl+Alt+I, профили per-exe в %APPDATA%\iFrame\profiles.toml, авто-аттач известных игр, always-on-top; UI жив 5+ мин, рендер подтверждён скриншотом
 - [x] M4 — Flip Model ✅: хуки фабрики CreateSwapChain/ForHwnd/ForCoreWindow/ForComposition (активный свопчейн + капы из desc), ResizeBuffers + инвалидация капс, tearing-aware К1 (SyncInterval=0+ALLOW_TEARING), waitable-детекция; верифицировано: детекция капс (flags=0x800 → tearing=true), обход композита (6096 FPS uncapped), лимит 40 FPS держится, процесс жив
 - [x] M5 — x86 ✅ (i686 DLL + инжектор с авто-выбором по разрядности + стенд x86); D3D9 ⚠️ частично: хук-цепочка реализована (IAT → CreateDevice → Present@17), самотест ✓, но d3d9.dll строит vtable девайсов динамически + откатывает патчи (анти-тампер) — устойчивое покрытие требует inline-хуков (бэклог)
-- [ ] M6 — ETW «только телеметрия» + чёрный список античитов
+- [x] M6 — чёрный список античитов ✅ (3 уровня: сервисы/модули/игры, проверка ДО любого доступа к процессу, в inject + UI); ETW telemetry-only ✅ (ferrisetw, DxgKrnl Present-события → live-график, ноль инъекции; требует админа — как PresentMon); UI-fallback: защищённая цель → авто-переход в ETW-режим
 - [ ] M7 — стресс-тест, сравнение с RTSS, релиз

@@ -52,6 +52,11 @@ fn qpc_freq() -> i64 {
     if f <= 0 { 10_000_000 } else { f }
 }
 
+/// Current QPC time in seconds — the x-axis unit of the live graph.
+pub fn qpc_seconds() -> f64 {
+    qpc_now() as f64 / qpc_freq() as f64
+}
+
 fn qpc_now() -> i64 {
     let mut v = 0i64;
     unsafe {
