@@ -58,12 +58,26 @@
 
 6. **Скриншот-верификация UI:** PowerShell System.Drawing CopyFromScreen → PNG → view_image — визуальное подтверждение рендера (график, оси, пунктирная линия цели, статус-бар, on-top тумблер).
 
+## 2026-08-29 · M4
+
+1. **ЛОВУШКА GetDesc1 (слот 17):** ручной вызов GetDesc1 через vtable, прочитанную из объекта по offset 0, вернул S_OK с ПОЛНОСТЬЮ нулевым desc (flags=0x0, buffers=0). Причина: vtable-указатель, хранящийся в объекте, — базовая IDXGISwapChain vtable (17 слотов, 0–16); слот 17 читает ПАМЯТЬ ЗА vtable → мусорный вызов (по сигнатуре — чужой QI) → S_OK + нули. Урок: слоты ЗА пределами базового интерфейса нельзя вызывать через vtable, прочитанную из объекта, — нужен QI для нужного интерфейса. Обход: в legacy DXGI_SWAP_CHAIN_DESC (GetDesc, слот 12 — работает) есть поле Flags → ОДИН вызов даёт windowed + ALLOW_TEARING (2048) + waitable (64). GetDesc1 не нужен вовсе.
+
+2. **Хуки фабрики** (IDXGIFactory2 vtable: CreateSwapChain@10, ForHwnd@14, ForCoreWindow@15, ForComposition@23): капы нового свопчейна берутся ПРЯМО из входного desc хука — ноль COM-вызовов; новейший свопчейн становится активным (лаунчеры создают свои раньше игры). Фабрика добывается из дамми-девайса: device.cast::<IDXGIDevice>() → GetAdapter() → GetParent::<IDXGIFactory2>().
+
+3. **TEARING РАБОТАЕТ — композит полностью обходится:** uncapped Present(0)+ALLOW_TEARING = **6096 FPS** (p50 108µs) — очередь/DWM не участвуют. Это доказывает: с флагом tearing кадр уходит straight-to-scanout.
+
+4. **DWM-троттлинг фоновых окон — ограничение стенда:** окно, запущенное из агентской сессии, не может удержать foreground (Windows foreground lock) → DWM композитит его на ~64.5 Гц → presents квантуются сеткой композита (15.4/30.8мс) ДАЖЕ с tearing-флагом в Present. Пейсер при этом работает точно: late=false везде, Брезенхэм по сетке, адаптивный margin 300µs → 6.4мс. Точный каденс 25мс верифицируется на foreground-окне (реальная игра / ручной запуск стенда пользователем).
+
+5. **Константы DXGI:** ALLOW_TEARING = swapchain-флаг 2048 / present-флаг 512; FRAME_LATENCY_WAITABLE_OBJECT = 64. DXGI_SWAP_CHAIN_DESC1.Flags — u32 (в отличие от i32-новтайпа флага).
+
+6. **ResizeBuffers@13** инвалидирует кэш капс → ленивый re-query на следующем paced-present (пересоздание свопчейна игрой после альт-таба/ресайза подхватывается автоматически).
+
 ## Состояние этапов
 - [x] M0 — workspace, pacer.rs (13 unit-тестов ✅), shared_mem.rs (SPSC ✅), DLL-смоук ✅, git init ✅
 - [x] M1 — инъекция ✅, vtable-хук Present@8/Present1@21 ✅, телеметрия ✅, hook_state через shared header ✅
 - [x] M2 — JIT-ядро в DLL ✅: лимит 40 FPS живьём (41.1/39.9/40.2/40.1), каденс Брезенхэма по сетке vblank (DWM 240 Гц), override SyncInterval (К1, только windowed), отключение → возврат 64.3 FPS, процесс жив, 13/13 тестов ✅
 - [x] M3 — UI ✅: egui-окно (график 10с + линия цели, статистика FPS/p50/p99/late, слайдер+пресеты FPS, режимы ZeroLag/VRR/Off, vsync override), трей (показать/скрыть, toggle, quit), глобальный хоткей Ctrl+Alt+I, профили per-exe в %APPDATA%\iFrame\profiles.toml, авто-аттач известных игр, always-on-top; UI жив 5+ мин, рендер подтверждён скриншотом
-- [ ] M4 — Flip Model: CreateSwapChain*/ResizeBuffers, waitable object (opt-in)
+- [x] M4 — Flip Model ✅: хуки фабрики CreateSwapChain/ForHwnd/ForCoreWindow/ForComposition (активный свопчейн + капы из desc), ResizeBuffers + инвалидация капс, tearing-aware К1 (SyncInterval=0+ALLOW_TEARING), waitable-детекция; верифицировано: детекция капс (flags=0x800 → tearing=true), обход композита (6096 FPS uncapped), лимит 40 FPS держится, процесс жив
 - [ ] M5 — D3D9 + x86
 - [ ] M6 — ETW «только телеметрия» + чёрный список античитов
 - [ ] M7 — стресс-тест, сравнение с RTSS, релиз
