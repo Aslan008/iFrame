@@ -111,13 +111,6 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
 }
 
 fn cmd_inject(args: &[String]) {
-    let dll = arg_value(args, "--dll")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_dll_path);
-    if !dll.exists() {
-        eprintln!("DLL not found: {}", dll.display());
-        std::process::exit(2);
-    }
     let pid = match arg_value(args, "--pid") {
         Some(p) => p.parse().unwrap_or_else(|_| {
             eprintln!("--pid must be a number");
@@ -137,6 +130,19 @@ fn cmd_inject(args: &[String]) {
             }
         },
     };
+
+    // Pick the DLL matching the target's bitness (unless --dll overrides).
+    let dll = match arg_value(args, "--dll") {
+        Some(p) => PathBuf::from(p),
+        None => injector::default_dll_path_for(pid),
+    };
+    if !dll.exists() {
+        eprintln!(
+            "DLL not found: {} (build it with: cargo build --release --target i686-pc-windows-msvc -p iframe-hook)",
+            dll.display()
+        );
+        std::process::exit(2);
+    }
 
     println!("creating shared memory for pid {pid} ...");
     let mapping = match sm_host::create_for_pid(pid) {

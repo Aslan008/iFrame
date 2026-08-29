@@ -1,3 +1,4 @@
+pub mod d3d9;
 pub mod dxgi;
 
 /// Install all hooks. Returns true on success (sets HOOK_STATE in lib.rs).
@@ -13,6 +14,11 @@ pub fn install() -> bool {
             false
         }
     };
+    // D3D9 is opportunistic: a DXGI-only game has no d3d9 device — a failure
+    // here is normal and must not fail the overall install.
+    if let Err(e) = unsafe { d3d9::install() } {
+        crate::log_line(&format!("d3d9 hooks skipped: {e}"));
+    }
     // Publish the state through the shared header — the control app polls it
     // there (the process-local HOOK_STATE atomic is invisible across processes).
     if let Some(ring) = crate::telemetry::ring() {
@@ -25,4 +31,5 @@ pub fn install() -> bool {
 /// unload must not leave hooked vtables behind).
 pub fn uninstall() {
     dxgi::uninstall();
+    d3d9::uninstall();
 }

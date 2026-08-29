@@ -1,0 +1,7 @@
+[package]
+name = "d3d9_test_app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+windows = { workspace = true }

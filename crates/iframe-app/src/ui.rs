@@ -81,7 +81,7 @@ impl IFrameApp {
                 return;
             }
         };
-        if let Err(e) = injector::inject(pid, &default_dll_path()) {
+        if let Err(e) = injector::inject(pid, &injector::default_dll_path_for(pid)) {
             log_ui(&format!("inject failed: {e}"));
             return;
         }

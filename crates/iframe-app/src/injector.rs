@@ -1,7 +1,7 @@
 //! DLL injection: classic `CreateRemoteThread` + `LoadLibraryW`.
 //!
 //! Safety posture:
-//! * Refuses 32-bit targets (x86 DLL is M5 scope).
+//! * 32-bit targets get the i686 DLL build (`default_dll_path_for`).
 //! * Refuses known anti-cheat processes (M6; the list lives in the app).
 //! * The DLL path is canonicalised before being written into the target.
 
@@ -33,13 +33,6 @@ pub fn inject(pid: u32, dll_path: &Path) -> Result<(), String> {
             pid,
         )
         .map_err(|e| format!("OpenProcess({pid}): {e} (elevated target? run as admin)"))?;
-
-        // x86 targets need the x86 DLL build (M5).
-        let mut wow64 = BOOL(0);
-        IsWow64Process(process, &mut wow64).map_err(|e| format!("IsWow64Process: {e}"))?;
-        if wow64.as_bool() {
-            return Err("target is a 32-bit process — x86 DLL support lands in M5".into());
-        }
 
         let path = std::fs::canonicalize(dll_path)
             .map_err(|e| format!("canonicalize dll path: {e}"))?
@@ -90,6 +83,28 @@ pub fn inject(pid: u32, dll_path: &Path) -> Result<(), String> {
 
 use windows::Win32::Foundation::FARPROC;
 type ThreadFn = unsafe extern "system" fn(*mut c_void) -> u32;
+
+/// Is `pid` a 32-bit process (on this 64-bit OS)?
+pub fn is_wow64(pid: u32) -> Result<bool, String> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid)
+            .map_err(|e| format!("OpenProcess({pid}): {e}"))?;
+        let mut wow64 = BOOL(0);
+        let r = IsWow64Process(process, &mut wow64).map_err(|e| format!("IsWow64Process: {e}"));
+        let _ = windows::Win32::Foundation::CloseHandle(process);
+        r?;
+        Ok(wow64.as_bool())
+    }
+}
+
+/// Default hook-DLL path for a target: 32-bit processes get the i686 build.
+pub fn default_dll_path_for(pid: u32) -> std::path::PathBuf {
+    if is_wow64(pid).unwrap_or(false) {
+        std::path::PathBuf::from("target/i686-pc-windows-msvc/release/iframe_hook.dll")
+    } else {
+        std::path::PathBuf::from("target/release/iframe_hook.dll")
+    }
+}
 
 /// Resolve the PID of a top-level window by exact title.
 pub fn pid_from_window_title(title: &str) -> Result<u32, String> {

@@ -583,7 +583,7 @@ unsafe fn query_swapchain_caps(this: *mut c_void) -> (bool, bool, bool) {
 // ---------------------------------------------------------------------------
 
 /// Overwrite `vtable[index]` with `hook`; returns the original pointer.
-unsafe fn patch_vtable_slot(
+pub unsafe fn patch_vtable_slot(
     vtable: *mut *mut c_void,
     index: usize,
     hook: *mut c_void,
@@ -601,7 +601,7 @@ unsafe fn patch_vtable_slot(
     Ok(orig)
 }
 
-unsafe fn restore_vtable(vtable: *mut *mut c_void, index: usize, orig: *mut c_void) {
+pub unsafe fn restore_vtable(vtable: *mut *mut c_void, index: usize, orig: *mut c_void) {
     if vtable.is_null() || orig.is_null() {
         return;
     }
