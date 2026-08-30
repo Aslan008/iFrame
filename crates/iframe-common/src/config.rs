@@ -11,6 +11,13 @@ pub struct RuntimeConfig {
     pub target_fps: f64,
     /// Display refresh rate as reported/overridden by the user.
     pub refresh_hz: f64,
+    /// К1: while pacing, override the game's VSync (`SyncInterval=0`, tearing
+    /// when the swap chain supports it). Off = pass the game's present args
+    /// through untouched. Mirrors the UI "override VSync" checkbox.
+    pub vsync_override: bool,
+    /// Per-game opt-in (M4): force `FRAME_LATENCY_WAITABLE_OBJECT` on new
+    /// swap chains of this process (hook side, see dxgi.rs).
+    pub force_waitable: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -20,6 +27,8 @@ impl Default for RuntimeConfig {
             mode: PacerMode::FixedVsync,
             target_fps: 60.0,
             refresh_hz: 60.0,
+            vsync_override: true,
+            force_waitable: false,
         }
     }
 }

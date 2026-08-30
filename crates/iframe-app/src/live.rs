@@ -14,6 +14,20 @@ use iframe_common::shared_mem::TelemetryFrame;
 /// How much frametime history the graph keeps.
 pub const HISTORY_SECONDS: f64 = 10.0;
 
+/// Frametime stats of a single limiter state (A/B compare: OFF = "before",
+/// ON = "after"). Percentiles span the whole bucket window (up to 10 s of
+/// that state), not the rolling 1 s used for the headline stats.
+#[derive(Default, Clone)]
+pub struct SideStats {
+    /// `(t in QPC seconds, frametime in µs)`, oldest first.
+    pub samples: VecDeque<(f64, f64)>,
+    pub fps: f64,
+    pub p50_us: f64,
+    pub p99_us: f64,
+    /// Frames seen in this state since the worker started (not windowed).
+    pub total: u64,
+}
+
 #[derive(Default)]
 pub struct LiveStats {
     /// `(present_start in QPC seconds, frametime in µs)`, oldest first.
@@ -24,6 +38,10 @@ pub struct LiveStats {
     pub late: u64,
     pub bypass: u64,
     pub total: u64,
+    /// Frametime stats while the limiter was OFF ("before").
+    pub off: SideStats,
+    /// Frametime stats while the limiter was ON ("after").
+    pub on: SideStats,
 }
 
 pub struct SharedState {
@@ -41,6 +59,67 @@ impl SharedState {
             attached_pid: AtomicU32::new(0),
             limiter_on: AtomicBool::new(false),
         })
+    }
+}
+
+/// Percentile `q` (0..1) of an ascending-sorted slice (same method as watch.rs).
+pub(crate) fn percentile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted.len() as f64 - 1.0) * q).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+/// FPS / p50 / p99 (µs) over one side-bucket window. Fewer than 2 samples → zeros.
+pub fn compute_side_stats(samples: &VecDeque<(f64, f64)>) -> (f64, f64, f64) {
+    if samples.len() < 2 {
+        return (0.0, 0.0, 0.0);
+    }
+    let mean = samples.iter().map(|(_, ft)| *ft).sum::<f64>() / samples.len() as f64;
+    let mut sorted: Vec<f64> = samples.iter().map(|(_, ft)| *ft).collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = percentile(&sorted, 0.50);
+    let p99 = percentile(&sorted, 0.99);
+    (if mean > 0.0 { 1e6 / mean } else { 0.0 }, p50, p99)
+}
+
+/// One A/B bucket: frametime samples of a single limiter state, trimmed to
+/// `HISTORY_SECONDS` relative to its own newest sample — an inactive bucket
+/// freezes on the tail of its period instead of draining away with wall time.
+struct SideBucket {
+    samples: VecDeque<(f64, f64)>,
+    total: u64,
+}
+
+impl SideBucket {
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(2048),
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, t: f64, ft_us: f64) {
+        self.samples.push_back((t, ft_us));
+        self.total += 1;
+        if let Some(&(newest, _)) = self.samples.back() {
+            let cutoff = newest - HISTORY_SECONDS;
+            while self.samples.front().is_some_and(|(t, _)| *t < cutoff) {
+                self.samples.pop_front();
+            }
+        }
+    }
+
+    fn publish(&self) -> SideStats {
+        let (fps, p50, p99) = compute_side_stats(&self.samples);
+        SideStats {
+            samples: self.samples.clone(),
+            fps,
+            p50_us: p50,
+            p99_us: p99,
+            total: self.total,
+        }
     }
 }
 
@@ -86,17 +165,26 @@ fn worker(pid: u32, state: Arc<SharedState>) {
     let mut bypass = 0u64;
     let mut total = 0u64;
     let mut samples: VecDeque<(f64, f64)> = VecDeque::with_capacity(2048);
+    let mut on_bucket = SideBucket::new();
+    let mut off_bucket = SideBucket::new();
 
     loop {
         if state.attached_pid.load(Ordering::Relaxed) != pid {
             break;
         }
         let n = sm_host::drain(ring, &mut scratch);
+        let limiter_on = state.limiter_on.load(Ordering::Relaxed);
         for f in &scratch[..n] {
             if let Some(prev) = last_present {
                 let ft_us = (f.present_start_qpc - prev) as f64 * 1e6 / freq;
                 if ft_us > 0.0 && ft_us < 1_000_000.0 {
-                    samples.push_back((f.present_start_qpc as f64 / freq, ft_us));
+                    let t_s = f.present_start_qpc as f64 / freq;
+                    samples.push_back((t_s, ft_us));
+                    if limiter_on {
+                        on_bucket.push(t_s, ft_us);
+                    } else {
+                        off_bucket.push(t_s, ft_us);
+                    }
                 }
             }
             last_present = Some(f.present_start_qpc);
@@ -143,8 +231,57 @@ fn worker(pid: u32, state: Arc<SharedState>) {
             stats.late = late;
             stats.bypass = bypass;
             stats.total = total;
+            stats.on = on_bucket.publish();
+            stats.off = off_bucket.publish();
         }
 
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dq(v: &[(f64, f64)]) -> VecDeque<(f64, f64)> {
+        v.iter().copied().collect()
+    }
+
+    #[test]
+    fn side_stats_empty_and_single_are_zero() {
+        assert_eq!(compute_side_stats(&VecDeque::new()), (0.0, 0.0, 0.0));
+        assert_eq!(compute_side_stats(&dq(&[(1.0, 5000.0)])), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn side_stats_constant_frametime_is_flat() {
+        let s = dq(&[(0.0, 16_666.667), (0.1, 16_666.667), (0.2, 16_666.667)]);
+        let (fps, p50, p99) = compute_side_stats(&s);
+        assert!((fps - 60.0).abs() < 0.01, "fps {fps}");
+        assert!((p50 - 16_666.667).abs() < 0.01, "p50 {p50}");
+        assert!((p99 - 16_666.667).abs() < 0.01, "p99 {p99}");
+    }
+
+    #[test]
+    fn side_stats_p99_catches_outliers() {
+        // 200 normal frames + 10 spikes → p99 must land on the spike value.
+        let mut v: Vec<(f64, f64)> = (0..200).map(|i| (i as f64, 10_000.0)).collect();
+        v.extend((200..210).map(|i| (i as f64, 50_000.0)));
+        let (_, _, p99) = compute_side_stats(&dq(&v));
+        assert!((p99 - 50_000.0).abs() < 1e-9, "p99 {p99}");
+    }
+
+    #[test]
+    fn side_bucket_trims_to_window_and_freezes_when_inactive() {
+        let mut b = SideBucket::new();
+        // 15 s of samples at 10 Hz → only the last 10 s survive the trim.
+        for i in 0..150 {
+            b.push(i as f64 * 0.1, 10_000.0);
+        }
+        assert_eq!(b.samples.len(), 101);
+        assert_eq!(b.total, 150);
+        let published = b.publish();
+        assert_eq!(published.total, 150);
+        assert!((published.fps - 100.0).abs() < 0.01);
     }
 }

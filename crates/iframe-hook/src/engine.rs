@@ -43,6 +43,16 @@ pub fn pace(
     cfg: &RuntimeConfig,
     hint: Option<VBlankHint>,
 ) -> Option<(i64, PacerDecision)> {
+    // User refresh override (CLI --refresh): replaces the DWM-reported
+    // refresh rate; the vblank PHASE stays on the DWM grid.
+    let hint = match hint {
+        Some(h) if cfg.refresh_hz > 1.0 => Some(VBlankHint {
+            refresh_hz: cfg.refresh_hz,
+            ..h
+        }),
+        other => other,
+    };
+
     let Ok(mut guard) = ENGINE.try_lock() else {
         return None; // another present in flight — never block the hot path
     };

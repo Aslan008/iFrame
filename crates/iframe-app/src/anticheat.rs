@@ -36,7 +36,6 @@ const PROTECTED_PROCESSES: &[&str] = &[
     "xigncode3.exe",
     "gameguard.exe",
     "weagle.exe",
-    "netsh.exe",
 ];
 
 /// Module names (lowercase) that indicate an anti-cheat is loaded into the

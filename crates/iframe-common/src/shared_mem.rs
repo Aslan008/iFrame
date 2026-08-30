@@ -75,7 +75,11 @@ pub struct SharedHeader {
     pub dropped: AtomicU64,
     /// 0 = initialising, 1 = hooks installed, 2 = init failed.
     pub hook_state: AtomicU32,
-    pub _pad: [u8; 4],
+    /// К1 toggle published by the app (0 = leave the game's VSync alone).
+    pub vsync_override: AtomicU32,
+    /// Per-game opt-in: force FRAME_LATENCY_WAITABLE_OBJECT on new swap chains.
+    pub force_waitable: AtomicU32,
+    pub _pad: [u8; 0],
 }
 
 /// Total mapping size for a given record capacity (power of two).
@@ -225,6 +229,12 @@ impl SharedRing {
         header
             .enabled
             .store(cfg.enabled as u32, Ordering::Release);
+        header
+            .vsync_override
+            .store(cfg.vsync_override as u32, Ordering::Release);
+        header
+            .force_waitable
+            .store(cfg.force_waitable as u32, Ordering::Release);
     }
 
     pub fn config(&self) -> crate::config::RuntimeConfig {
@@ -234,6 +244,8 @@ impl SharedRing {
             mode: crate::pacer::PacerMode::from_u32(header.mode.load(Ordering::Acquire)),
             target_fps: f64::from_bits(header.target_fps_bits.load(Ordering::Acquire)),
             refresh_hz: f64::from_bits(header.refresh_hz_bits.load(Ordering::Acquire)),
+            vsync_override: header.vsync_override.load(Ordering::Acquire) != 0,
+            force_waitable: header.force_waitable.load(Ordering::Acquire) != 0,
         }
     }
 
@@ -373,6 +385,8 @@ mod tests {
                 mode: crate::pacer::PacerMode::FixedVsync,
                 target_fps: 40.0,
                 refresh_hz: 120.0,
+                vsync_override: true,
+                force_waitable: false,
             };
             ring.set_config(&cfg);
             assert_eq!(ring.config(), cfg);

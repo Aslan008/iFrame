@@ -267,7 +267,7 @@ unsafe extern "system" fn hooked_present(this: *mut c_void, sync_interval: u32, 
     // SyncInterval=0 (DWM still composites at vblank); exclusive fullscreen
     // keeps the game's own VSync.
     let (sync, present_flags) = if pacing {
-        unsafe { override_sync(sync_interval, flags) }
+        unsafe { override_sync(sync_interval, flags, cfg.vsync_override) }
     } else {
         (sync_interval, flags)
     };
@@ -303,7 +303,7 @@ unsafe extern "system" fn hooked_present1(
     let active = is_active_swapchain(this);
     let pacing = active && cfg.enabled && cfg.mode != PacerMode::Bypass;
     let (sync, present_flags) = if pacing {
-        unsafe { override_sync(sync_interval, flags) }
+        unsafe { override_sync(sync_interval, flags, cfg.vsync_override) }
     } else {
         (sync_interval, flags)
     };
@@ -333,8 +333,13 @@ unsafe extern "system" fn hooked_present1(
     hr
 }
 
-/// К1 sync/flags override for paced presents.
-unsafe fn override_sync(sync_interval: u32, flags: u32) -> (u32, u32) {
+/// К1 sync/flags override for paced presents. `enabled` mirrors the app's
+/// "override VSync" checkbox — off means the game's own present args pass
+/// through untouched.
+unsafe fn override_sync(sync_interval: u32, flags: u32, enabled: bool) -> (u32, u32) {
+    if !enabled {
+        return (sync_interval, flags);
+    }
     ensure_caps();
     static LOGGED: AtomicBool = AtomicBool::new(false);
     if !LOGGED.swap(true, Ordering::Relaxed) {

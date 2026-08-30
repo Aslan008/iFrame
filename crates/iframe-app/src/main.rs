@@ -66,6 +66,8 @@ fn cmd_limit(args: &[String]) {
         mode,
         target_fps: fps,
         refresh_hz: refresh,
+        vsync_override: !args.iter().any(|a| a == "--no-vsync-override"),
+        force_waitable: args.iter().any(|a| a == "--waitable"),
     };
     mapping.ring.set_config(&cfg);
     if enabled {
@@ -100,9 +102,7 @@ fn cmd_list() {
         }
     }
     unsafe {
-        if let Err(e) = EnumWindows(Some(cb), LPARAM(0)) {
-            eprintln!("EnumWindows: {e}");
-        }
+        let _ = EnumWindows(Some(cb), LPARAM(0));
     }
 }
 
@@ -148,6 +148,8 @@ fn cmd_inject(args: &[String]) {
     }
 
     println!("creating shared memory for pid {pid} ...");
+    // Held for the rest of the function: dropping it early would destroy the
+    // section object before the injected DLL gets a chance to attach.
     let mapping = match sm_host::create_for_pid(pid) {
         Ok(m) => m,
         Err(e) => {
@@ -155,22 +157,12 @@ fn cmd_inject(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let _ = mapping; // keep the mapping alive until injection completes
 
     println!("injecting {} into pid {pid} ...", dll.display());
     if let Err(e) = injector::inject(pid, &dll) {
         eprintln!("inject failed: {e}");
         std::process::exit(1);
     }
-
-    // Wait for the hook to report readiness through the shared header.
-    let mapping = match sm_host::open(pid) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("re-open mapping: {e}");
-            std::process::exit(1);
-        }
-    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let state = mapping.ring.hook_state();
@@ -260,4 +252,5 @@ fn print_usage() {
     println!("  iframe inject --pid <N> | --window <title> [--dll <path>]");
     println!("  iframe watch  --pid <N> [--seconds <S>]");
     println!("  iframe limit  --pid <N> --fps <F> [--mode vsync|vrr|off] [--refresh <Hz>]");
+    println!("                [--no-vsync-override] [--waitable]");
 }

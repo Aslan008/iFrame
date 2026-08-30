@@ -388,11 +388,46 @@ impl eframe::App for IFrameApp {
                 .unwrap_or_default();
             ui.horizontal(|ui| {
                 stat(ui, "FPS", &format!("{fps:.1}"));
-                stat(ui, "p50", &format!("{p50:.2} ms"));
-                stat(ui, "p99", &format!("{p99:.2} ms"));
+                stat(ui, "p50", &format!("{:.2} ms", p50 / 1000.0));
+                stat(ui, "p99", &format!("{:.2} ms", p99 / 1000.0));
                 stat(ui, "late", &format!("{late}"));
                 stat(ui, "frames", &format!("{total}"));
             });
+
+            // A/B compare: frametime with the limiter OFF ("before") vs ON
+            // ("after"). Each side keeps its own trailing 10 s window, so the
+            // inactive side freezes on the tail of its period instead of
+            // draining away with wall time.
+            let ((off_fps, off_p50, off_p99, off_n), (on_fps, on_p50, on_p99, on_n)) = self
+                .state
+                .stats
+                .try_lock()
+                .map(|s| {
+                    let view = |x: &live::SideStats| (x.fps, x.p50_us, x.p99_us, x.total);
+                    (view(&s.off), view(&s.on))
+                })
+                .unwrap_or_default();
+            egui::Grid::new("ab_compare")
+                .num_columns(3)
+                .spacing([12.0, 2.0])
+                .show(ui, |ui| {
+                    ui.weak("frametime, last 10 s per state");
+                    ui.weak("limiter OFF (before)");
+                    ui.weak("limiter ON (after)");
+                    ui.end_row();
+                    ui.weak("FPS");
+                    ab_val(ui, off_n, format!("{off_fps:.1}"));
+                    ab_val(ui, on_n, format!("{on_fps:.1}"));
+                    ui.end_row();
+                    ui.weak("p50");
+                    ab_val(ui, off_n, format!("{:.2} ms", off_p50 / 1000.0));
+                    ab_val(ui, on_n, format!("{:.2} ms", on_p50 / 1000.0));
+                    ui.end_row();
+                    ui.weak("p99");
+                    ab_val(ui, off_n, format!("{:.2} ms", off_p99 / 1000.0));
+                    ab_val(ui, on_n, format!("{:.2} ms", on_p99 / 1000.0));
+                    ui.end_row();
+                });
             ui.add_space(6.0);
 
             // --- limiter controls ---
@@ -507,6 +542,15 @@ fn stat(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.separator();
 }
 
+/// A/B cell: "—" until the side has at least 2 samples, else the value.
+fn ab_val(ui: &mut egui::Ui, total: u64, text: String) {
+    if total < 2 {
+        ui.weak("—");
+    } else {
+        ui.monospace(text);
+    }
+}
+
 fn live_now_s() -> f64 {
     let (mut v, mut f) = (0i64, 0i64);
     unsafe {
@@ -526,11 +570,10 @@ fn enumerate_windows() -> Vec<(u32, String)> {
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
     };
-    let out: Arc<std::sync::Mutex<Vec<(u32, String)>>> = Arc::default();
-    let sink = out.clone();
+    let mut out: Vec<(u32, String)> = Vec::new();
     unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let sink: &Arc<std::sync::Mutex<Vec<(u32, String)>>> =
-            unsafe { &*(lparam.0 as *const Arc<std::sync::Mutex<Vec<(u32, String)>>>) };
+        let sink: &mut Vec<(u32, String)> =
+            unsafe { &mut *(lparam.0 as *mut Vec<(u32, String)>) };
         unsafe {
             if !IsWindowVisible(hwnd).as_bool() {
                 return BOOL(1);
@@ -543,19 +586,17 @@ fn enumerate_windows() -> Vec<(u32, String)> {
             let title = String::from_utf16_lossy(&buf[..len as usize]);
             let mut pid = 0u32;
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
-            if let Ok(mut list) = sink.lock() {
-                list.push((pid, title));
-            }
+            sink.push((pid, title));
             BOOL(1)
         }
     }
     unsafe {
-        let _ = windows::Win32::UI::WindowsAndMessaging::EnumWindows(
+        let _ = EnumWindows(
             Some(cb),
-            LPARAM(Arc::as_ptr(&sink) as isize),
+            LPARAM(&mut out as *mut Vec<(u32, String)> as isize),
         );
     }
-    out.lock().map(|l| l.clone()).unwrap_or_default()
+    out
 }
 
 fn process_exe_name(pid: u32) -> Option<String> {

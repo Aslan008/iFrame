@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::Provider;
@@ -51,6 +51,8 @@ pub fn start_watch(pid: u32, state: Arc<SharedState>) -> Result<EtwWatch, String
     let state_cb = state.clone();
     let stop2 = stop_flag.clone();
     let stop3 = stop_flag.clone();
+    // Throttle for the A/B + headline stats recompute (worker cadence: 20 ms).
+    let last_publish = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60)));
 
     let provider = Provider::by_guid(DXGKRNL_GUID)
         .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
@@ -83,6 +85,17 @@ pub fn start_watch(pid: u32, state: Arc<SharedState>) -> Result<EtwWatch, String
             *last = ts;
             drop(last);
 
+            // One stats recompute per 20 ms (matches the SM worker cadence).
+            let due = {
+                let mut lp = last_publish.lock().unwrap();
+                if lp.elapsed() >= Duration::from_millis(20) {
+                    *lp = Instant::now();
+                    true
+                } else {
+                    false
+                }
+            };
+
             if frametime_us > 0.0 {
                 let mut stats = state_cb.stats.lock().unwrap();
                 let now_qpc = crate::live::qpc_seconds();
@@ -96,6 +109,23 @@ pub fn start_watch(pid: u32, state: Arc<SharedState>) -> Result<EtwWatch, String
                     } else {
                         break;
                     }
+                }
+                // A/B side stats: in ETW mode the limiter can never be on, so
+                // every sample belongs to the OFF ("before") side. This also
+                // fills the headline FPS/p50/p99 row, which ETW previously left
+                // at zero (in inject mode the live.rs worker owns it).
+                if due {
+                    let (fps, p50, p99) = crate::live::compute_side_stats(&stats.samples);
+                    stats.fps = fps;
+                    stats.p50_us = p50;
+                    stats.p99_us = p99;
+                    stats.off = crate::live::SideStats {
+                        samples: stats.samples.clone(),
+                        fps,
+                        p50_us: p50,
+                        p99_us: p99,
+                        total: stats.total,
+                    };
                 }
             }
         })

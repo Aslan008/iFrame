@@ -3,6 +3,7 @@
 use std::time::{Duration, Instant};
 use windows::Win32::System::Performance::QueryPerformanceFrequency;
 
+use crate::live::percentile;
 use crate::sm_host;
 use iframe_common::shared_mem::TelemetryFrame;
 
@@ -67,12 +68,4 @@ fn print_second(present_starts: &[i64], freq: i64) {
         p99,
         max
     );
-}
-
-fn percentile(sorted: &[f64], q: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let idx = ((sorted.len() as f64 - 1.0) * q).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
 }
