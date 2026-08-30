@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::Provider;
 use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::{TraceTrait, UserTrace};
+use ferrisetw::trace::UserTrace;
 use ferrisetw::EventRecord;
 
 use crate::live::SharedState;
@@ -43,7 +43,6 @@ impl EtwWatch {
 /// Start observing `pid`'s presents via ETW and feed the live graph.
 pub fn start_watch(pid: u32, state: Arc<SharedState>) -> Result<EtwWatch, String> {
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let stop_cb = stop_flag.clone();
     let trace_name = format!("iFrame-ETW-{pid}");
 
     let target = Arc::new(AtomicU32::new(pid));
@@ -125,6 +124,9 @@ pub fn start_watch(pid: u32, state: Arc<SharedState>) -> Result<EtwWatch, String
                         p50_us: p50,
                         p99_us: p99,
                         total: stats.total,
+                        hold_p50_us: 0.0,
+                        wait_p50_us: 0.0,
+                        has_timing: false,
                     };
                 }
             }
@@ -138,7 +140,7 @@ pub fn start_watch(pid: u32, state: Arc<SharedState>) -> Result<EtwWatch, String
             .enable(provider)
             .start_and_process();
         match trace {
-            Ok(mut t) => {
+            Ok(t) => {
                 while !stop3.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(200));
                 }

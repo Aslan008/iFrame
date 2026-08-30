@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,10 @@ pub struct GameProfile {
     pub vsync_override: bool,
     #[serde(default)]
     pub auto_attach: bool,
+    /// Force FRAME_LATENCY_WAITABLE_OBJECT on this game's swap chains
+    /// (per-game opt-in, applied by the hook at swap chain creation).
+    #[serde(default)]
+    pub force_waitable: bool,
 }
 
 impl Default for GameProfile {
@@ -22,6 +27,7 @@ impl Default for GameProfile {
             mode: "vsync".into(),
             vsync_override: true,
             auto_attach: false,
+            force_waitable: false,
         }
     }
 }
@@ -35,6 +41,10 @@ struct FileFormat {
 pub struct Profiles {
     path: PathBuf,
     games: HashMap<String, GameProfile>,
+    /// Unwritten changes. The UI re-publishes settings on every drag tick, so
+    /// disk writes are debounced to at most one per second (`flush_due`).
+    dirty: bool,
+    last_save: Instant,
 }
 
 impl Profiles {
@@ -45,7 +55,12 @@ impl Profiles {
             .and_then(|s| toml::from_str::<FileFormat>(&s).ok())
             .map(|f| f.games)
             .unwrap_or_default();
-        Self { path, games }
+        Self {
+            path,
+            games,
+            dirty: false,
+            last_save: Instant::now(),
+        }
     }
 
     fn path() -> PathBuf {
@@ -59,10 +74,25 @@ impl Profiles {
 
     pub fn set(&mut self, exe: &str, profile: GameProfile) {
         self.games.insert(exe.to_string(), profile);
-        self.save();
+        self.dirty = true;
+        self.flush_due();
     }
 
-    fn save(&self) {
+    /// Write pending changes if the debounce interval has elapsed.
+    pub fn flush_due(&mut self) {
+        if self.dirty && self.last_save.elapsed() >= Duration::from_secs(1) {
+            self.save();
+        }
+    }
+
+    /// Write pending changes now (app shutdown).
+    pub fn flush(&mut self) {
+        if self.dirty {
+            self.save();
+        }
+    }
+
+    fn save(&mut self) {
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -72,5 +102,7 @@ impl Profiles {
         if let Ok(s) = toml::to_string_pretty(&file) {
             let _ = std::fs::write(&self.path, s);
         }
+        self.dirty = false;
+        self.last_save = Instant::now();
     }
 }

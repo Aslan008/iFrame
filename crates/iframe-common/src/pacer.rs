@@ -66,16 +66,28 @@ pub struct PacerConfig {
     pub deviation_beta: f64,
 }
 
-impl Default for PacerConfig {
-    fn default() -> Self {
+impl PacerConfig {
+    /// Create a config tailored for the given mode with optimal latency margins.
+    pub fn for_mode(mode: PacerMode, target_fps: f64) -> Self {
+        let base_safety_margin_us = match mode {
+            PacerMode::Vrr => 50.0,        // Aggressive Race-the-Beam for G-Sync/FreeSync
+            PacerMode::FixedVsync => 250.0, // Safe margin for fixed VBlank grid
+            PacerMode::Bypass => 0.0,
+        };
         Self {
-            target_fps: 60.0,
-            mode: PacerMode::FixedVsync,
-            base_safety_margin_us: 300.0,
+            target_fps,
+            mode,
+            base_safety_margin_us,
             variance_multiplier: 2.0,
             ema_alpha: 0.15,
             deviation_beta: 0.10,
         }
+    }
+}
+
+impl Default for PacerConfig {
+    fn default() -> Self {
+        Self::for_mode(PacerMode::FixedVsync, 60.0)
     }
 }
 

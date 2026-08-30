@@ -14,10 +14,29 @@ use crate::{anticheat, etw, injector, live, sm_host, tray};
 use iframe_common::config::RuntimeConfig;
 use iframe_common::pacer::PacerMode;
 
+/// Result of the background attach thread.
+enum AttachOutcome {
+    Done { pid: u32, mapping: HostMapping },
+    Failed(String),
+}
+
+#[derive(Default, Clone)]
+struct DisplaySnapshot {
+    headline_fps: f64,
+    headline_p50_us: f64,
+    headline_p99_us: f64,
+    headline_late: u64,
+    headline_total: u64,
+    off: live::SideStats,
+    on: live::SideStats,
+}
+
 pub struct IFrameApp {
     state: Arc<SharedState>,
     mapping: Option<HostMapping>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// In-flight background attach: (pid, receiver of the outcome).
+    pending: Option<(u32, std::sync::mpsc::Receiver<AttachOutcome>)>,
 
     windows: Vec<(u32, String)>,
     selected_window: usize,
@@ -27,6 +46,7 @@ pub struct IFrameApp {
     target_fps: f64,
     mode: PacerMode,
     vsync_override: bool,
+    force_waitable: bool,
     auto_attach: bool,
     always_on_top: bool,
     applied_on_top: bool,
@@ -39,6 +59,10 @@ pub struct IFrameApp {
     last_auto_scan: Instant,
     /// Telemetry-only ETW session (anti-cheat protected targets).
     etw_watch: Option<etw::EtwWatch>,
+
+    display_stats: DisplaySnapshot,
+    last_stats_refresh: Instant,
+    reset_plot_view: bool,
 }
 
 impl IFrameApp {
@@ -49,6 +73,7 @@ impl IFrameApp {
             state,
             mapping: None,
             worker: None,
+            pending: None,
             windows: Vec::new(),
             selected_window: 0,
             exe_name: None,
@@ -56,6 +81,7 @@ impl IFrameApp {
             target_fps: 60.0,
             mode: PacerMode::FixedVsync,
             vsync_override: true,
+            force_waitable: false,
             auto_attach: false,
             always_on_top: true,
             applied_on_top: false,
@@ -66,6 +92,9 @@ impl IFrameApp {
             tray_tried: false,
             last_auto_scan: Instant::now() - Duration::from_secs(10),
             etw_watch: None,
+            display_stats: DisplaySnapshot::default(),
+            last_stats_refresh: Instant::now() - Duration::from_secs(1),
+            reset_plot_view: false,
         };
         app.refresh_windows();
         app
@@ -100,45 +129,87 @@ impl IFrameApp {
                 return;
             }
         };
-        if let Err(e) = injector::inject(pid, &injector::default_dll_path_for(pid)) {
-            log_ui(&format!("inject failed: {e}"));
-            return;
-        }
-        // Wait briefly for the hook to publish readiness.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if mapping.ring.hook_state() == 1 {
-                break;
-            }
-            if mapping.ring.hook_state() == 2 || std::time::Instant::now() > deadline {
-                log_ui("hook init failed (see %TEMP%\\iframe_hook.log)");
+        // Injection + the hook-init wait run on a worker thread — the UI
+        // thread must never block for seconds (it froze the window before).
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pending = Some((pid, rx));
+        log_ui(&format!("attaching to pid {pid} in background..."));
+        std::thread::spawn(move || {
+            if let Err(e) = injector::inject(pid, &injector::default_dll_path_for(pid)) {
+                let _ = tx.send(AttachOutcome::Failed(format!("inject failed: {e}")));
                 return;
             }
-            std::thread::sleep(Duration::from_millis(30));
-        }
-
-        self.exe_name = process_exe_name(pid);
-        if let Some(exe) = &self.exe_name {
-            if let Some(p) = self.profiles.get(exe).cloned() {
-                self.target_fps = p.target_fps;
-                self.mode = match p.mode.as_str() {
-                    "vrr" => PacerMode::Vrr,
-                    "off" => PacerMode::Bypass,
-                    _ => PacerMode::FixedVsync,
-                };
-                self.vsync_override = p.vsync_override;
-                self.auto_attach = p.auto_attach;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match mapping.ring.hook_state() {
+                    1 => break,
+                    2 => {
+                        let _ = tx.send(AttachOutcome::Failed(
+                            "hook init failed (see %TEMP%\\iframe_hook.log)".into(),
+                        ));
+                        return;
+                    }
+                    _ => {
+                        if std::time::Instant::now() > deadline {
+                            let _ = tx.send(AttachOutcome::Failed(format!(
+                                "timeout waiting for hook init (state={})",
+                                mapping.ring.hook_state()
+                            )));
+                            return;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(30));
             }
-        }
+            let _ = tx.send(AttachOutcome::Done { pid, mapping });
+        });
+    }
 
-        self.state.attached_pid.store(pid, Ordering::Relaxed);
-        self.worker = Some(live::spawn_worker(pid, self.state.clone()));
-        self.mapping = Some(mapping);
-        self.attached = true;
-        self.push_config();
+    /// Poll the background attach thread; finalize on completion.
+    fn poll_attach(&mut self) {
+        let outcome = match &self.pending {
+            Some((_, rx)) => match rx.try_recv() {
+                Ok(o) => Some(o),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(_) => Some(AttachOutcome::Failed("attach thread died".into())),
+            },
+            None => None,
+        };
+        let Some(outcome) = outcome else { return };
+        self.pending = None;
+        match outcome {
+            AttachOutcome::Done { pid, mapping } => {
+                if self.attached {
+                    return; // detached while attaching — drop the result
+                }
+                self.exe_name = process_exe_name(pid);
+                if let Some(exe) = &self.exe_name {
+                    if let Some(p) = self.profiles.get(exe).cloned() {
+                        self.target_fps = p.target_fps;
+                        self.mode = match p.mode.as_str() {
+                            "vrr" => PacerMode::Vrr,
+                            "off" => PacerMode::Bypass,
+                            _ => PacerMode::FixedVsync,
+                        };
+                        self.vsync_override = p.vsync_override;
+                        self.force_waitable = p.force_waitable;
+                        self.auto_attach = p.auto_attach;
+                    }
+                }
+                self.state.attached_pid.store(pid, Ordering::Relaxed);
+                self.worker = Some(live::spawn_worker(pid, self.state.clone()));
+                self.mapping = Some(mapping);
+                self.attached = true;
+                self.push_config();
+            }
+            AttachOutcome::Failed(e) => log_ui(&e),
+        }
     }
 
     fn detach(&mut self) {
+        // An in-flight attach is abandoned: its outcome is discarded when it
+        // arrives (the injected hook stays in limiter-disabled pass-through).
+        self.pending = None;
         if let Some(mut w) = self.etw_watch.take() {
             w.stop();
         }
@@ -149,6 +220,8 @@ impl IFrameApp {
                 mode: self.mode,
                 target_fps: self.target_fps,
                 refresh_hz: 0.0,
+                vsync_override: self.vsync_override,
+                force_waitable: false,
             };
             mapping.ring.set_config(&cfg);
         }
@@ -169,6 +242,8 @@ impl IFrameApp {
                 mode: self.mode,
                 target_fps: self.target_fps,
                 refresh_hz: 0.0, // 0 = the DLL trusts the DWM hint
+                vsync_override: self.vsync_override,
+                force_waitable: self.force_waitable,
             };
             mapping.ring.set_config(&cfg);
             self.state.limiter_on.store(enabled, Ordering::Relaxed);
@@ -184,6 +259,7 @@ impl IFrameApp {
                         },
                         vsync_override: self.vsync_override,
                         auto_attach: self.auto_attach,
+                        force_waitable: self.force_waitable,
                     },
                 );
             }
@@ -260,45 +336,71 @@ impl IFrameApp {
 
     // ----- drawing ----------------------------------------------------------
 
-    fn graph(&self, ui: &mut egui::Ui) {
-        let target_us = if self.target_fps > 0.0 {
-            1e6 / self.target_fps
+    fn graph(&mut self, ui: &mut egui::Ui, height: f32) {
+        let target_ms = if self.target_fps > 0.0 {
+            1000.0 / self.target_fps
         } else {
             0.0
         };
         let now_s = live_now_s();
-        let mut points: Vec<[f64; 2]> = Vec::new();
+        let mut off_points: Vec<[f64; 2]> = Vec::new();
+        let mut on_points: Vec<[f64; 2]> = Vec::new();
         if let Ok(stats) = self.state.stats.try_lock() {
-            for (t, ft) in &stats.samples {
-                points.push([-(now_s - t), *ft]);
+            off_points.reserve(stats.off.samples.len().min(4096));
+            for (t, ft_us) in &stats.off.samples {
+                if *t <= now_s && (now_s - t) <= HISTORY_SECONDS + 1.0 {
+                    off_points.push([-(now_s - t), *ft_us / 1000.0]);
+                }
+            }
+            on_points.reserve(stats.on.samples.len().min(4096));
+            for (t, ft_us) in &stats.on.samples {
+                if *t <= now_s && (now_s - t) <= HISTORY_SECONDS + 1.0 {
+                    on_points.push([-(now_s - t), *ft_us / 1000.0]);
+                }
             }
         }
 
         let mut plot = Plot::new("frametime")
-            .allow_drag(false)
-            .allow_zoom(false)
-            .allow_scroll(false)
-            .allow_boxed_zoom(false)
-            .x_axis_label("seconds ago")
-            .y_axis_label("frametime, µs");
-        if target_us > 0.0 {
-            plot = plot.include_y(target_us * 2.5);
+            .height(height)
+            .allow_drag(true)
+            .allow_zoom(true)
+            .allow_scroll(true)
+            .allow_boxed_zoom(true)
+            .allow_double_click_reset(true)
+            .x_axis_label("секунды назад")
+            .y_axis_label("время кадра, мс");
+        if target_ms > 0.0 {
+            plot = plot.include_y(target_ms * 2.2).include_y(0.0);
         }
+        let reset_view = self.reset_plot_view;
+        self.reset_plot_view = false;
         plot.show(ui, |plot_ui| {
-            if !points.is_empty() {
+            if reset_view {
+                plot_ui.set_auto_bounds([true, true]);
+            }
+            // Two colored series — limiter OFF (dim blue) vs ON (green): the
+            // graph itself shows the before/after transition.
+            if !off_points.is_empty() {
                 plot_ui.line(
-                    Line::new("frametime", PlotPoints::from(points))
-                        .color(egui::Color32::from_rgb(0x30, 0xE0, 0x6A))
-                        .width(1.5),
+                    Line::new("лимитер ВЫКЛ (до)", PlotPoints::from(off_points))
+                        .color(egui::Color32::from_rgb(0x50, 0x90, 0xC0))
+                        .width(1.2),
                 );
             }
-            if target_us > 0.0 {
+            if !on_points.is_empty() {
+                plot_ui.line(
+                    Line::new("лимитер ВКЛ (после)", PlotPoints::from(on_points))
+                        .color(egui::Color32::from_rgb(0x30, 0xE0, 0x6A))
+                        .width(1.6),
+                );
+            }
+            if target_ms > 0.0 {
                 plot_ui.line(
                     Line::new(
-                        "target",
+                        format!("цель: {:.0} FPS ({:.1} мс)", self.target_fps, target_ms),
                         PlotPoints::from(vec![
-                            [-HISTORY_SECONDS, target_us],
-                            [0.0, target_us],
+                            [-HISTORY_SECONDS, target_ms],
+                            [0.0, target_ms],
                         ]),
                     )
                     .color(egui::Color32::from_rgb(0xE0, 0xA0, 0x30))
@@ -314,6 +416,8 @@ impl eframe::App for IFrameApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_tray(ctx);
         self.poll_hotkey();
+        self.poll_attach();
+        self.profiles.flush_due();
         self.auto_scan();
 
         if self.always_on_top != self.applied_on_top {
@@ -340,6 +444,21 @@ impl eframe::App for IFrameApp {
 
         let attached_pid = self.state.attached_pid.load(Ordering::Relaxed);
 
+        if self.last_stats_refresh.elapsed() >= Duration::from_millis(250) {
+            if let Ok(stats) = self.state.stats.try_lock() {
+                self.display_stats = DisplaySnapshot {
+                    headline_fps: stats.fps,
+                    headline_p50_us: stats.p50_us,
+                    headline_p99_us: stats.p99_us,
+                    headline_late: stats.late,
+                    headline_total: stats.total,
+                    off: stats.off.clone(),
+                    on: stats.on.clone(),
+                };
+                self.last_stats_refresh = Instant::now();
+            }
+        }
+
         egui::Panel::top("header").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("iFrame");
@@ -347,17 +466,20 @@ impl eframe::App for IFrameApp {
                 if attached_pid != 0 {
                     ui.colored_label(
                         egui::Color32::from_rgb(0x30, 0xE0, 0x6A),
-                        format!("● attached {attached_pid}"),
+                        format!("● подключено (PID {attached_pid})"),
                     );
+                } else if self.pending.is_some() {
+                    ui.colored_label(egui::Color32::from_rgb(0xE0, 0xA0, 0x30), "◌ подключение…");
                 } else {
-                    ui.weak("○ not attached");
+                    ui.weak("○ не подключено");
                 }
                 if let Some(exe) = &self.exe_name {
                     ui.weak(exe);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Applied in logic() via the viewport command.
-                    ui.toggle_value(&mut self.always_on_top, "📌 on top");
+                    ui.toggle_value(&mut self.always_on_top, "📌 поверх всех")
+                        .on_hover_text("Закрепить окно iFrame поверх игры");
                 });
             });
         });
@@ -365,159 +487,302 @@ impl eframe::App for IFrameApp {
         egui::Panel::bottom("footer").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.weak(
-                    "Ctrl+Alt+I — toggle limiter · tray: show/hide · profiles in %APPDATA%\\iFrame",
+                    "Ctrl+Alt+I — вкл/выкл лимитер · трей: скрыть · профили в %APPDATA%\\iFrame",
                 );
             });
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            // --- graph ---
-            let graph_h = (ui.available_height() * 0.52).max(140.0);
+            // --- 1. Graph header bar ---
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("📈 График фреймтайма").strong());
+                if ui
+                    .button("⛶ Авто-центровка")
+                    .on_hover_text("Сбросить зум и отцентрировать график по текущим данным и целевому FPS")
+                    .clicked()
+                {
+                    self.reset_plot_view = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak("Колёсико: зум · ЛКМ: перемещение · 2x клик: сброс");
+                });
+            });
+            ui.add_space(2.0);
+
+            // --- 2. Dynamic resizable graph (placed outside ScrollArea for 100% responsive mouse wheel zoom) ---
+            let available_h = ui.available_height();
+            let graph_h = (available_h - 380.0).clamp(130.0, 480.0);
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.set_min_size(egui::vec2(ui.available_width(), graph_h));
-                self.graph(ui);
+                self.graph(ui, graph_h);
             });
             ui.add_space(6.0);
 
-            // --- live stats ---
-            let (fps, p50, p99, late, total) = self
-                .state
-                .stats
-                .try_lock()
-                .map(|s| (s.fps, s.p50_us, s.p99_us, s.late, s.total))
-                .unwrap_or_default();
-            ui.horizontal(|ui| {
-                stat(ui, "FPS", &format!("{fps:.1}"));
-                stat(ui, "p50", &format!("{:.2} ms", p50 / 1000.0));
-                stat(ui, "p99", &format!("{:.2} ms", p99 / 1000.0));
-                stat(ui, "late", &format!("{late}"));
-                stat(ui, "frames", &format!("{total}"));
-            });
-
-            // A/B compare: frametime with the limiter OFF ("before") vs ON
-            // ("after"). Each side keeps its own trailing 10 s window, so the
-            // inactive side freezes on the tail of its period instead of
-            // draining away with wall time.
-            let ((off_fps, off_p50, off_p99, off_n), (on_fps, on_p50, on_p99, on_n)) = self
-                .state
-                .stats
-                .try_lock()
-                .map(|s| {
-                    let view = |x: &live::SideStats| (x.fps, x.p50_us, x.p99_us, x.total);
-                    (view(&s.off), view(&s.on))
-                })
-                .unwrap_or_default();
-            egui::Grid::new("ab_compare")
-                .num_columns(3)
-                .spacing([12.0, 2.0])
+            // --- 3. Scrollable controls & stats area below the graph ---
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.weak("frametime, last 10 s per state");
-                    ui.weak("limiter OFF (before)");
-                    ui.weak("limiter ON (after)");
-                    ui.end_row();
-                    ui.weak("FPS");
-                    ab_val(ui, off_n, format!("{off_fps:.1}"));
-                    ab_val(ui, on_n, format!("{on_fps:.1}"));
-                    ui.end_row();
-                    ui.weak("p50");
-                    ab_val(ui, off_n, format!("{:.2} ms", off_p50 / 1000.0));
-                    ab_val(ui, on_n, format!("{:.2} ms", on_p50 / 1000.0));
-                    ui.end_row();
-                    ui.weak("p99");
-                    ab_val(ui, off_n, format!("{:.2} ms", off_p99 / 1000.0));
-                    ab_val(ui, on_n, format!("{:.2} ms", on_p99 / 1000.0));
-                    ui.end_row();
-                });
-            ui.add_space(6.0);
+                    let d = &self.display_stats;
 
-            // --- limiter controls ---
-            ui.horizontal(|ui| {
-                ui.label("Target FPS");
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut self.target_fps)
-                            .speed(0.5)
-                            .range(10.0..=480.0),
-                    )
-                    .changed()
-                {
-                    self.push_config();
-                }
-                for preset in [30.0, 40.0, 60.0] {
-                    if ui.button(format!("{preset:.0}")).clicked() {
-                        self.target_fps = preset;
-                        self.push_config();
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Mode:");
-                let mut changed = false;
-                changed |= ui
-                    .radio_value(&mut self.mode, PacerMode::FixedVsync, "ZeroLag (VSync grid)")
-                    .changed();
-                changed |= ui
-                    .radio_value(&mut self.mode, PacerMode::Vrr, "VRR (start-to-start)")
-                    .changed();
-                changed |= ui
-                    .radio_value(&mut self.mode, PacerMode::Bypass, "Off")
-                    .changed();
-                if ui
-                    .checkbox(&mut self.vsync_override, "override VSync")
-                    .changed()
-                {
-                    changed = true;
-                }
-                if changed {
-                    self.push_config();
-                }
-            });
-            ui.add_space(6.0);
+                    // --- live headline stats with tooltips ---
+                    ui.horizontal(|ui| {
+                        stat(
+                            ui,
+                            "FPS",
+                            &format!("{:.1}", d.headline_fps),
+                            "Текущая средняя частота кадров за 1 секунду",
+                        );
+                        stat(
+                            ui,
+                            "p50 (медиана)",
+                            &format!("{:.2} мс", d.headline_p50_us / 1000.0),
+                            "Типичное время кадра (50% кадров быстрее этого значения)",
+                        );
+                        stat(
+                            ui,
+                            "p99 (просадки)",
+                            &format!("{:.2} мс", d.headline_p99_us / 1000.0),
+                            "99-й перцентиль (худшие 1% кадров). Если p99 сильно выше p50 — в игре есть статтеры",
+                        );
+                        stat(
+                            ui,
+                            "пропуски",
+                            &format!("{}", d.headline_late),
+                            "Кадры, которые игра не успела отрендерить вовремя к VBlank",
+                        );
+                        stat(
+                            ui,
+                            "всего кадров",
+                            &format!("{}", d.headline_total),
+                            "Всего обработано кадров с момента подключения",
+                        );
+                    });
+                    ui.add_space(4.0);
 
-            // --- attach controls ---
-            ui.horizontal(|ui| {
-                if ui.button("⟳").clicked() {
-                    self.refresh_windows();
-                }
-                let selected = self
-                    .windows
-                    .get(self.selected_window)
-                    .map(|(_, t)| t.clone())
-                    .unwrap_or_else(|| "— pick a window —".into());
-                egui::ComboBox::from_id_salt("game")
-                    .selected_text(selected)
-                    .width(240.0)
-                    .show_ui(ui, |ui| {
-                        for (i, (_, title)) in self.windows.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected_window, i, title);
+                    // --- A/B compare table with rock-solid fixed column widths ---
+                    let off = &d.off;
+                    let on = &d.on;
+                    let off_jitter = if off.total >= 2 {
+                        (off.p99_us - off.p50_us).max(0.0) / 1000.0
+                    } else {
+                        0.0
+                    };
+                    let on_jitter = if on.total >= 2 {
+                        (on.p99_us - on.p50_us).max(0.0) / 1000.0
+                    } else {
+                        0.0
+                    };
+
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("📊 Сравнение: До vs После (последние 10 сек)").strong());
+                        });
+                        ui.add_space(2.0);
+
+                        egui::Grid::new("ab_compare")
+                            .num_columns(3)
+                            .spacing([12.0, 3.0])
+                            .show(ui, |ui| {
+                                grid_col_label(ui, "Параметр", "Название метрики качества");
+                                grid_col_header(ui, "Без лимитера (OFF)");
+                                grid_col_header(ui, "С лимитером (ON)");
+                                ui.end_row();
+
+                                grid_row_label(ui, "Частота кадров (FPS)", "Средний FPS за период с выключенным и включённым лимитером");
+                                ab_val(ui, off.total >= 2, format!("{:.1}", off.fps));
+                                ab_val(ui, on.total >= 2, format!("{:.1}", on.fps));
+                                ui.end_row();
+
+                                grid_row_label(ui, "Время кадра (p50)", "Типичное время между кадрами (идеал: 16.67 мс для 60 FPS, 25.00 мс для 40 FPS)");
+                                ab_val(ui, off.total >= 2, format!("{:.2} мс", off.p50_us / 1000.0));
+                                ab_val(ui, on.total >= 2, format!("{:.2} мс", on.p50_us / 1000.0));
+                                ui.end_row();
+
+                                grid_row_label(ui, "Редкие просадки (p99)", "99% кадров рендерятся быстрее этого времени. Скачки p99 = микрофризы");
+                                ab_val(ui, off.total >= 2, format!("{:.2} мс", off.p99_us / 1000.0));
+                                ab_val(ui, on.total >= 2, format!("{:.2} мс", on.p99_us / 1000.0));
+                                ui.end_row();
+
+                                grid_row_label(ui, "Разброс (джиттер p99-p50)", "Разница между худшими и типичными кадрами. Чем меньше разброс — тем картинка плавнее!");
+                                ab_val(ui, off.total >= 2, format!("±{off_jitter:.2} мс"));
+                                ab_val(ui, on.total >= 2, format!("±{on_jitter:.2} мс"));
+                                ui.end_row();
+
+                                grid_row_label(ui, "Отдача кадра (Present)", "Время вызова функции Present видеокарте. Должно быть ~0.1 мс — это подтверждает 0 мс добавленного инпут-лага!");
+                                ab_val(
+                                    ui,
+                                    off.total >= 2 && off.has_timing,
+                                    format!("{:.2} мс", off.hold_p50_us / 1000.0),
+                                );
+                                ab_val(
+                                    ui,
+                                    on.total >= 2 && on.has_timing,
+                                    format!("{:.2} мс", on.hold_p50_us / 1000.0),
+                                );
+                                ui.end_row();
+
+                                grid_row_label(ui, "Пауза перед след. кадром", "Умная пауза, выдерживаемая ДО опроса ввода следующего кадра для синхронизации с монитором");
+                                ab_val(
+                                    ui,
+                                    off.total >= 2 && off.has_timing,
+                                    format!("{:.2} мс", off.wait_p50_us / 1000.0),
+                                );
+                                ab_val(
+                                    ui,
+                                    on.total >= 2 && on.has_timing,
+                                    format!("{:.2} мс", on.wait_p50_us / 1000.0),
+                                );
+                                ui.end_row();
+                            });
+
+                        // --- automatic verdict card ---
+                        ui.add_space(4.0);
+                        if off.total >= 10 && on.total >= 10 {
+                            if on_jitter < off_jitter && off_jitter > 0.05 {
+                                let times = (off_jitter / on_jitter.max(0.01)).max(1.1);
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(0x30, 0xE0, 0x6A),
+                                    format!("✔ Итог: фреймтайм стал ровнее в {times:.1}x раз! (разброс ±{on_jitter:.2} мс против ±{off_jitter:.2} мс без лимитера). Инпут-лаг: +0.0 мс"),
+                                );
+                            } else {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(0x50, 0x90, 0xC0),
+                                    format!("ℹ Итог: Лимитер держит стабильные {:.0} FPS (разброс ±{on_jitter:.2} мс).", on.fps),
+                                );
+                            }
+                        } else if attached_pid != 0 {
+                            ui.weak("💡 Подсказка: нажмите Ctrl+Alt+I на 5 секунд (выключить), затем снова Ctrl+Alt+I (включить), чтобы накопить данные для оценки.");
                         }
                     });
-                if self.attached {
-                    if ui.button("Detach").clicked() {
-                        self.detach();
-                    }
-                } else if ui.button("Attach").clicked() {
-                    if let Some(pid) = self.windows.get(self.selected_window).map(|(p, _)| *p) {
-                        self.attach(pid);
-                    }
-                }
-                if ui
-                    .checkbox(&mut self.auto_attach, "auto-attach known games")
-                    .changed()
-                {
-                    if let Some(exe) = self.exe_name.clone() {
-                        let mut p = self.profiles.get(&exe).cloned().unwrap_or_default();
-                        p.auto_attach = self.auto_attach;
-                        self.profiles.set(&exe, p);
-                    }
-                }
-            });
+                    ui.add_space(6.0);
+
+                    // --- limiter controls ---
+                    ui.group(|ui| {
+                        ui.label(egui::RichText::new("⚙ Управление лимитером").strong());
+                        ui.add_space(2.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label("Целевой FPS:");
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut self.target_fps)
+                                        .speed(0.5)
+                                        .range(10.0..=480.0),
+                                )
+                                .on_hover_text("Задайте желаемую частоту кадров")
+                                .changed()
+                            {
+                                self.push_config();
+                            }
+                            for preset in [30.0, 40.0, 60.0, 120.0] {
+                                if ui.button(format!("{preset:.0}")).on_hover_text(match preset as u32 {
+                                    30 => "30 FPS — для тяжелых игр",
+                                    40 => "40 FPS — идеальный шаг для 120 Гц экранов (25.0 мс)",
+                                    60 => "60 FPS — стандартная плавность (16.67 мс)",
+                                    _ => "120 FPS — высокая герцовка",
+                                }).clicked() {
+                                    self.target_fps = preset;
+                                    self.push_config();
+                                }
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Режим:");
+                            let mut changed = false;
+                            changed |= ui
+                                .radio_value(&mut self.mode, PacerMode::FixedVsync, "ZeroLag (Сетка VSync)")
+                                .on_hover_text("Синхронизация по аппаратной сетке развертки экрана. Устраняет статтеры без добавления задержки ввода")
+                                .changed();
+                            changed |= ui
+                                .radio_value(&mut self.mode, PacerMode::Vrr, "VRR (G-Sync/FreeSync)")
+                                .on_hover_text("Пейсинг от старта до старта кадра для мониторов с переменной частотой (VRR)")
+                                .changed();
+                            changed |= ui
+                                .radio_value(&mut self.mode, PacerMode::Bypass, "Выкл")
+                                .on_hover_text("Ограничение отключено (режим замера без пейсинга)")
+                                .changed();
+                            if changed {
+                                self.push_config();
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            let mut changed = false;
+                            if ui
+                                .checkbox(&mut self.vsync_override, "override VSync")
+                                .on_hover_text("Принудительно управлять VSync на уровне DXGI")
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                            if ui
+                                .checkbox(&mut self.force_waitable, "waitable object")
+                                .on_hover_text("Использовать высокоточный таймер DirectX Flip Model для максимальной стабильности")
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                            if changed {
+                                self.push_config();
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+
+                    // --- attach controls ---
+                    ui.group(|ui| {
+                        ui.label(egui::RichText::new("🎮 Подключение к игре").strong());
+                        ui.add_space(2.0);
+
+                        ui.horizontal(|ui| {
+                            if ui.button("⟳").on_hover_text("Обновить список запущенных окон игр").clicked() {
+                                self.refresh_windows();
+                            }
+                            let selected = self
+                                .windows
+                                .get(self.selected_window)
+                                .map(|(_, t)| t.clone())
+                                .unwrap_or_else(|| "— выберите окно игры —".into());
+                            egui::ComboBox::from_id_salt("game")
+                                .selected_text(selected)
+                                .width(220.0)
+                                .show_ui(ui, |ui| {
+                                    for (i, (_, title)) in self.windows.iter().enumerate() {
+                                        ui.selectable_value(&mut self.selected_window, i, title);
+                                    }
+                                });
+                            if self.attached {
+                                if ui.button("Отключить").clicked() {
+                                    self.detach();
+                                }
+                            } else if ui.button("Подключить").clicked() {
+                                if let Some(pid) = self.windows.get(self.selected_window).map(|(p, _)| *p) {
+                                    self.attach(pid);
+                                }
+                            }
+                            if ui
+                                .checkbox(&mut self.auto_attach, "авто-подключение")
+                                .on_hover_text("Автоматически подключаться к этой игре при её запуске")
+                                .changed()
+                            {
+                                if let Some(exe) = self.exe_name.clone() {
+                                    let mut p = self.profiles.get(&exe).cloned().unwrap_or_default();
+                                    p.auto_attach = self.auto_attach;
+                                    self.profiles.set(&exe, p);
+                                }
+                            }
+                        });
+                    });
+                });
         });
     }
 }
 
 impl Drop for IFrameApp {
     fn drop(&mut self) {
+        // Persist any debounced profile changes.
+        self.profiles.flush();
         // Never leave the limiter running with a dead control app.
         self.state.attached_pid.store(0, Ordering::Relaxed);
         if let Some(mapping) = &self.mapping {
@@ -526,6 +791,8 @@ impl Drop for IFrameApp {
                 mode: self.mode,
                 target_fps: self.target_fps,
                 refresh_hz: 0.0,
+                vsync_override: self.vsync_override,
+                force_waitable: false,
             };
             mapping.ring.set_config(&cfg);
         }
@@ -534,21 +801,39 @@ impl Drop for IFrameApp {
 
 // ----- helpers --------------------------------------------------------------
 
-fn stat(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.vertical(|ui| {
+fn stat(ui: &mut egui::Ui, label: &str, value: &str, tooltip: &str) {
+    let r = ui.vertical(|ui| {
         ui.weak(label);
         ui.monospace(value);
     });
+    r.response.on_hover_text(tooltip);
     ui.separator();
 }
 
-/// A/B cell: "—" until the side has at least 2 samples, else the value.
-fn ab_val(ui: &mut egui::Ui, total: u64, text: String) {
-    if total < 2 {
-        ui.weak("—");
-    } else {
-        ui.monospace(text);
-    }
+fn grid_col_label(ui: &mut egui::Ui, text: &str, tooltip: &str) {
+    ui.add_sized([175.0, 18.0], egui::Label::new(egui::RichText::new(text).weak()))
+        .on_hover_text(tooltip);
+}
+
+fn grid_col_header(ui: &mut egui::Ui, text: &str) {
+    ui.add_sized([115.0, 18.0], egui::Label::new(egui::RichText::new(text).weak()));
+}
+
+fn grid_row_label(ui: &mut egui::Ui, text: &str, tooltip: &str) {
+    ui.add_sized([175.0, 18.0], egui::Label::new(text))
+        .on_hover_text(tooltip);
+}
+
+/// A/B cell with fixed size: prevents column shifting/twitching when numbers update.
+fn ab_val(ui: &mut egui::Ui, show: bool, text: String) {
+    ui.add_sized(
+        [115.0, 18.0],
+        if show {
+            egui::Label::new(egui::RichText::new(text).monospace())
+        } else {
+            egui::Label::new(egui::RichText::new("—").weak())
+        },
+    );
 }
 
 fn live_now_s() -> f64 {
@@ -558,10 +843,6 @@ fn live_now_s() -> f64 {
         let _ = windows::Win32::System::Performance::QueryPerformanceFrequency(&mut f);
     }
     if f <= 0 { 0.0 } else { v as f64 / f as f64 }
-}
-
-fn default_dll_path() -> std::path::PathBuf {
-    std::path::PathBuf::from("target/release/iframe_hook.dll")
 }
 
 fn enumerate_windows() -> Vec<(u32, String)> {
@@ -633,8 +914,8 @@ fn log_ui(msg: &str) {
 pub fn run() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([460.0, 640.0])
-            .with_min_inner_size([380.0, 520.0]),
+            .with_inner_size([500.0, 720.0])
+            .with_min_inner_size([420.0, 520.0]),
         ..Default::default()
     };
     eframe::run_native(

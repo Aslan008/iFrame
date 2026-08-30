@@ -152,6 +152,12 @@ impl SharedRing {
         if !cap.is_power_of_two() || len < total_size(cap) {
             return None;
         }
+        // Fast-forward tail if the consumer attaches after producer has wrapped
+        let head = header.head.load(Ordering::Acquire);
+        let tail = header.tail.load(Ordering::Acquire);
+        if head > tail + (cap as u64) {
+            header.tail.store(head.saturating_sub(cap as u64), Ordering::Release);
+        }
         Some(Self { ptr, len })
     }
 
@@ -192,7 +198,12 @@ impl SharedRing {
     pub fn pop(&self) -> Option<TelemetryFrame> {
         let header = self.header();
         let head = header.head.load(Ordering::Acquire);
-        let tail = header.tail.load(Ordering::Acquire);
+        let mut tail = header.tail.load(Ordering::Acquire);
+        let cap = self.capacity() as u64;
+        if head > tail + cap {
+            tail = head.saturating_sub(cap);
+            header.tail.store(tail, Ordering::Release);
+        }
         if tail >= head {
             return None;
         }
@@ -257,7 +268,6 @@ impl SharedRing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
 
     /// 64-byte aligned heap buffer for tests (Vec<u8> is only 1-aligned).
     struct AlignedBuf {
@@ -346,7 +356,6 @@ mod tests {
 
     #[test]
     fn spsc_two_threads_transfer_10k() {
-        use std::sync::Arc;
         let cap = 256usize;
         let buf = AlignedBuf::new(total_size(cap));
         unsafe {

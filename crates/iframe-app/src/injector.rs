@@ -8,7 +8,6 @@
 use std::ffi::c_void;
 use std::path::Path;
 use windows::core::{s, w, BOOL, PCWSTR};
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
@@ -17,8 +16,6 @@ use windows::Win32::System::Threading::{
     PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
     PROCESS_VM_WRITE,
 };
-
-type ThreadStart = unsafe extern "system" fn(*mut c_void) -> u32;
 
 /// Inject `dll_path` into process `pid` (x64 only in M1).
 pub fn inject(pid: u32, dll_path: &Path) -> Result<(), String> {
@@ -83,7 +80,6 @@ pub fn inject(pid: u32, dll_path: &Path) -> Result<(), String> {
     }
 }
 
-use windows::Win32::Foundation::FARPROC;
 type ThreadFn = unsafe extern "system" fn(*mut c_void) -> u32;
 
 /// Is `pid` a 32-bit process (on this 64-bit OS)?
@@ -99,13 +95,48 @@ pub fn is_wow64(pid: u32) -> Result<bool, String> {
     }
 }
 
-/// Default hook-DLL path for a target: 32-bit processes get the i686 build.
+/// Default hook-DLL path for a target: checks next to the running executable,
+/// then target/release, target/debug, and workspace root.
 pub fn default_dll_path_for(pid: u32) -> std::path::PathBuf {
-    if is_wow64(pid).unwrap_or(false) {
-        std::path::PathBuf::from("target/i686-pc-windows-msvc/release/iframe_hook.dll")
+    let dll_name = if is_wow64(pid).unwrap_or(false) {
+        "iframe_hook32.dll"
     } else {
-        std::path::PathBuf::from("target/release/iframe_hook.dll")
+        "iframe_hook.dll"
+    };
+
+    // 1. Next to the running executable (release or debug folder):
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join(dll_name);
+            if p.exists() {
+                return p;
+            }
+        }
     }
+
+    // 2. Standard workspace build locations:
+    let candidates = [
+        format!("target/release/{dll_name}"),
+        format!("target/debug/{dll_name}"),
+        format!("target/i686-pc-windows-msvc/release/{dll_name}"),
+        format!("target/i686-pc-windows-msvc/debug/{dll_name}"),
+        dll_name.to_string(),
+    ];
+
+    for c in &candidates {
+        let p = std::path::PathBuf::from(c);
+        if p.exists() {
+            return p;
+        }
+    }
+
+    // Default fallback
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join(dll_name);
+        }
+    }
+    std::path::PathBuf::from(format!("target/release/{dll_name}"))
 }
 
 /// Resolve the PID of a top-level window by exact title.

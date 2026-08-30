@@ -33,6 +33,8 @@ impl Drop for View {
 }
 
 pub struct HostMapping {
+    /// Never read directly — held so `Drop` keeps the section mapped.
+    #[allow(dead_code)]
     view: View,
     pub ring: SharedRing,
 }

@@ -8,6 +8,12 @@
 //! * `install()` runs once; a second load of the DLL is a no-op.
 //! * The Present hot path is lock-free: QPC + ring push + trampoline call.
 
+// The hook is unsafe-by-nature (vtable patching, raw COM calls); every
+// `unsafe fn` here is a documented trust boundary, and wrapping each operation
+// in nested `unsafe {}` blocks adds noise without safety. Revisit when this
+// lint becomes a hard error in a future Rust edition.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 mod engine;
 mod hooks;
 mod telemetry;

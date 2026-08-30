@@ -26,6 +26,14 @@ pub struct SideStats {
     pub p99_us: f64,
     /// Frames seen in this state since the worker started (not windowed).
     pub total: u64,
+    /// p50 of the real Present call duration (`present_end − present_start`).
+    /// Unchanged by the limiter — proof the completed frame is never held.
+    pub hold_p50_us: f64,
+    /// p50 of the hook's pacing wait (`release − present_end`) — the delay
+    /// applied to the NEXT frame's start only.
+    pub wait_p50_us: f64,
+    /// False for ETW telemetry (no present-duration data there).
+    pub has_timing: bool,
 }
 
 #[derive(Default)]
@@ -89,25 +97,58 @@ pub fn compute_side_stats(samples: &VecDeque<(f64, f64)>) -> (f64, f64, f64) {
 /// freezes on the tail of its period instead of draining away with wall time.
 struct SideBucket {
     samples: VecDeque<(f64, f64)>,
+    holds: VecDeque<f64>,
+    waits: VecDeque<f64>,
     total: u64,
 }
+
+/// Median of an unsorted queue.
+fn p50_of(v: &VecDeque<f64>) -> f64 {
+    let mut s: Vec<f64> = v.iter().copied().collect();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    percentile(&s, 0.50)
+}
+
+const MAX_QUEUE_SAMPLES: usize = 4096;
 
 impl SideBucket {
     fn new() -> Self {
         Self {
-            samples: VecDeque::with_capacity(2048),
+            samples: VecDeque::with_capacity(1024),
+            holds: VecDeque::with_capacity(1024),
+            waits: VecDeque::with_capacity(1024),
             total: 0,
         }
     }
 
-    fn push(&mut self, t: f64, ft_us: f64) {
-        self.samples.push_back((t, ft_us));
-        self.total += 1;
-        if let Some(&(newest, _)) = self.samples.back() {
-            let cutoff = newest - HISTORY_SECONDS;
-            while self.samples.front().is_some_and(|(t, _)| *t < cutoff) {
-                self.samples.pop_front();
+    fn push(&mut self, t: f64, ft_us: f64, hold_us: f64, wait_us: f64) {
+        // Reset if time went backwards (e.g. clock jump or ring wrap around)
+        if let Some(&(last_t, _)) = self.samples.back() {
+            if t < last_t {
+                self.samples.clear();
+                self.holds.clear();
+                self.waits.clear();
             }
+        }
+
+        self.samples.push_back((t, ft_us));
+        self.holds.push_back(hold_us);
+        self.waits.push_back(wait_us);
+        self.total += 1;
+
+        let cutoff = t - HISTORY_SECONDS;
+        while let Some(&(front_t, _)) = self.samples.front() {
+            if front_t < cutoff || self.samples.len() > MAX_QUEUE_SAMPLES {
+                self.samples.pop_front();
+                self.holds.pop_front();
+                self.waits.pop_front();
+            } else {
+                break;
+            }
+        }
+        while self.holds.len() > self.samples.len() {
+            self.holds.pop_front();
+            self.waits.pop_front();
         }
     }
 
@@ -119,6 +160,9 @@ impl SideBucket {
             p50_us: p50,
             p99_us: p99,
             total: self.total,
+            hold_p50_us: p50_of(&self.holds),
+            wait_p50_us: p50_of(&self.waits),
+            has_timing: true,
         }
     }
 }
@@ -164,7 +208,7 @@ fn worker(pid: u32, state: Arc<SharedState>) {
     let mut late = 0u64;
     let mut bypass = 0u64;
     let mut total = 0u64;
-    let mut samples: VecDeque<(f64, f64)> = VecDeque::with_capacity(2048);
+    let mut samples: VecDeque<(f64, f64)> = VecDeque::with_capacity(1024);
     let mut on_bucket = SideBucket::new();
     let mut off_bucket = SideBucket::new();
 
@@ -179,11 +223,23 @@ fn worker(pid: u32, state: Arc<SharedState>) {
                 let ft_us = (f.present_start_qpc - prev) as f64 * 1e6 / freq;
                 if ft_us > 0.0 && ft_us < 1_000_000.0 {
                     let t_s = f.present_start_qpc as f64 / freq;
+                    // Present call duration (unchanged by the limiter) and the
+                    // pacing wait applied AFTER the real Present returned.
+                    let hold_us = (f.present_end_qpc - f.present_start_qpc) as f64 * 1e6 / freq;
+                    let wait_us = (f.release_qpc - f.present_end_qpc).max(0) as f64 * 1e6 / freq;
+
+                    // Reset on backwards time jump
+                    if let Some(&(last_t, _)) = samples.back() {
+                        if t_s < last_t {
+                            samples.clear();
+                        }
+                    }
                     samples.push_back((t_s, ft_us));
+
                     if limiter_on {
-                        on_bucket.push(t_s, ft_us);
+                        on_bucket.push(t_s, ft_us, hold_us, wait_us);
                     } else {
-                        off_bucket.push(t_s, ft_us);
+                        off_bucket.push(t_s, ft_us, hold_us, wait_us);
                     }
                 }
             }
@@ -200,8 +256,12 @@ fn worker(pid: u32, state: Arc<SharedState>) {
         // Trim history to the graph window.
         if let Some(&(newest, _)) = samples.back() {
             let cutoff = newest - HISTORY_SECONDS;
-            while samples.front().is_some_and(|(t, _)| *t < cutoff) {
-                samples.pop_front();
+            while let Some(&(front_t, _)) = samples.front() {
+                if front_t < cutoff || samples.len() > MAX_QUEUE_SAMPLES {
+                    samples.pop_front();
+                } else {
+                    break;
+                }
             }
         }
 
@@ -276,12 +336,16 @@ mod tests {
         let mut b = SideBucket::new();
         // 15 s of samples at 10 Hz → only the last 10 s survive the trim.
         for i in 0..150 {
-            b.push(i as f64 * 0.1, 10_000.0);
+            b.push(i as f64 * 0.1, 10_000.0, 120.0, 5.0);
         }
         assert_eq!(b.samples.len(), 101);
+        assert_eq!(b.holds.len(), 101);
         assert_eq!(b.total, 150);
         let published = b.publish();
         assert_eq!(published.total, 150);
+        assert!(published.has_timing);
         assert!((published.fps - 100.0).abs() < 0.01);
+        assert!((published.hold_p50_us - 120.0).abs() < 1e-9);
+        assert!((published.wait_p50_us - 5.0).abs() < 1e-9);
     }
 }

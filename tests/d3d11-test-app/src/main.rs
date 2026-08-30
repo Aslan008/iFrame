@@ -8,6 +8,7 @@
 //!                       [--width <W>] [--height <H>]
 
 use std::io::Write;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
@@ -28,11 +29,21 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::Sleep;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, PeekMessageW, PostQuitMessage,
-    RegisterClassW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG, PM_REMOVE,
-    SW_SHOW, WINDOW_EX_STYLE, WM_DESTROY, WM_QUIT, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    RegisterClassW, SetWindowTextW, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG,
+    PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_QUIT,
+    WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
-const WINDOW_TITLE: &str = "iFrame Test D3D11";
+static INGAME_CAP_BITS: AtomicU64 = AtomicU64::new(0);
+static LAST_CLICK_QPC: AtomicI64 = AtomicI64::new(0);
+
+fn set_cap(fps: f64) {
+    INGAME_CAP_BITS.store(fps.to_bits(), Ordering::Relaxed);
+}
+
+fn get_cap() -> f64 {
+    f64::from_bits(INGAME_CAP_BITS.load(Ordering::Relaxed))
+}
 
 struct Args {
     cpu_ms: f64,
@@ -41,6 +52,8 @@ struct Args {
     width: u32,
     height: u32,
     tearing: bool,
+    delay: u64,
+    cap_fps: f64,
 }
 
 fn parse_args() -> Args {
@@ -53,6 +66,8 @@ fn parse_args() -> Args {
         width: 640,
         height: 360,
         tearing: false,
+        delay: 0,
+        cap_fps: 0.0,
     };
     let mut i = 0;
     while i < argv.len() {
@@ -63,6 +78,8 @@ fn parse_args() -> Args {
             "--width" => cfg.width = get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(640),
             "--height" => cfg.height = get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(360),
             "--tearing" => cfg.tearing = true,
+            "--delay" => cfg.delay = get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--cap-fps" => cfg.cap_fps = get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0),
             _ => {}
         }
         i += 1;
@@ -72,11 +89,13 @@ fn parse_args() -> Args {
 
 fn main() {
     let args = parse_args();
+    set_cap(args.cap_fps);
     println!("PID={}", std::process::id());
     println!(
-        "d3d11_test_app: {}x{}, vsync={}, cpu_ms={:.2}, tearing={}",
-        args.width, args.height, args.vsync, args.cpu_ms, args.tearing
+        "d3d11_test_app: {}x{}, vsync={}, cpu_ms={:.2}, tearing={}, in-game-cap={:.1}",
+        args.width, args.height, args.vsync, args.cpu_ms, args.tearing, args.cap_fps
     );
+    println!("Controls: [Space]/[L] = Toggle In-Game Limiter (60 FPS vs Uncapped), [Up]/[Down] = Adjust Cap");
     let _ = std::io::stdout().flush();
     run_window(args);
 }
@@ -89,9 +108,38 @@ fn run_window(args: Args) {
         lparam: LPARAM,
     ) -> LRESULT {
         unsafe {
-            if msg == WM_DESTROY {
-                PostQuitMessage(0);
-                return LRESULT(0);
+            match msg {
+                WM_DESTROY => {
+                    PostQuitMessage(0);
+                    return LRESULT(0);
+                }
+                WM_LBUTTONDOWN => {
+                    let mut now = 0i64;
+                    let _ = windows::Win32::System::Performance::QueryPerformanceCounter(&mut now);
+                    LAST_CLICK_QPC.store(now, Ordering::Relaxed);
+                    return LRESULT(0);
+                }
+                WM_KEYDOWN => {
+                    let key = wparam.0 as i32;
+                    if key == 0x20 || key == 0x4C { // Space or 'L'
+                        let cur = get_cap();
+                        let next = if cur > 0.0 { 0.0 } else { 60.0 };
+                        set_cap(next);
+                        println!("In-game limiter toggled: {:.1} FPS", next);
+                    } else if key == 0x26 { // Up arrow
+                        let cur = get_cap();
+                        let next = (cur + 10.0).clamp(10.0, 360.0);
+                        set_cap(next);
+                        println!("In-game cap set to: {:.1} FPS", next);
+                    } else if key == 0x28 { // Down arrow
+                        let cur = get_cap();
+                        let next = (cur - 10.0).max(10.0);
+                        set_cap(next);
+                        println!("In-game cap set to: {:.1} FPS", next);
+                    }
+                    return LRESULT(0);
+                }
+                _ => {}
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -126,6 +174,15 @@ fn run_window(args: Args) {
         // (~64 Hz), which would quantize presents regardless of tearing.
         // A real game runs in the foreground — mirror that here.
         let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+
+        // Optional delay BEFORE swap chain creation — the injector uses it to
+        // publish a config (force_waitable) first and watch the factory hook
+        // apply it to a swap chain created afterwards.
+        if args.delay > 0 {
+            println!("delaying swap chain creation by {}s ...", args.delay);
+            let _ = std::io::stdout().flush();
+            Sleep((args.delay * 1000) as u32);
+        }
 
         // Modern creation path: the swap chain goes through the factory's
         // CreateSwapChainForHwnd — exactly what the iFrame factory hook sees.
@@ -191,6 +248,14 @@ fn run_window(args: Args) {
         let start = std::time::Instant::now();
         let mut msg = MSG::default();
         let mut phase = 0.0f32;
+        let mut last_frame = std::time::Instant::now();
+        let mut last_title_update = std::time::Instant::now();
+        let mut frames_count = 0u32;
+        let mut last_fps_time = std::time::Instant::now();
+        let mut current_fps = 0.0f64;
+        let mut current_ft = 0.0f64;
+        let mut target_qpc = 0i64;
+
         loop {
             // Pump messages.
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -213,10 +278,80 @@ fn run_window(args: Args) {
             phase += 0.01;
             let color = [0.5 + 0.5 * phase.sin(), 0.5, 0.5 - 0.5 * phase.sin(), 1.0];
             context.ClearRenderTargetView(&rtv, &color);
-            let hr = swapchain.Present(args.vsync, DXGI_PRESENT(0));
+
+            // Classic In-Game Limiter (Absolute QPC Anchor — holds the frame before Present)
+            let cap = get_cap();
+            if cap > 0.0 {
+                let mut freq = 0i64;
+                let mut now_qpc = 0i64;
+                let _ = windows::Win32::System::Performance::QueryPerformanceFrequency(&mut freq);
+                let _ = windows::Win32::System::Performance::QueryPerformanceCounter(&mut now_qpc);
+                if freq > 0 {
+                    let interval_ticks = (freq as f64 / cap).round() as i64;
+                    if target_qpc == 0 || (now_qpc - target_qpc).abs() > interval_ticks * 2 {
+                        target_qpc = now_qpc + interval_ticks;
+                    } else {
+                        target_qpc += interval_ticks;
+                    }
+                    while now_qpc < target_qpc {
+                        std::hint::spin_loop();
+                        let _ = windows::Win32::System::Performance::QueryPerformanceCounter(&mut now_qpc);
+                    }
+                }
+            } else {
+                target_qpc = 0;
+            }
+
+            let present_flags = if args.tearing && args.vsync == 0 {
+                windows::Win32::Graphics::Dxgi::DXGI_PRESENT_ALLOW_TEARING
+            } else {
+                DXGI_PRESENT(0)
+            };
+            let hr = swapchain.Present(args.vsync, present_flags);
             if hr.is_err() {
                 eprintln!("Present failed: {:?}", hr);
                 break;
+            }
+
+            let now = std::time::Instant::now();
+            current_ft = now.duration_since(last_frame).as_secs_f64() * 1000.0;
+            last_frame = now;
+            frames_count += 1;
+
+            if last_fps_time.elapsed().as_secs_f64() >= 0.5 {
+                current_fps = frames_count as f64 / last_fps_time.elapsed().as_secs_f64();
+                frames_count = 0;
+                last_fps_time = std::time::Instant::now();
+            }
+
+            if last_title_update.elapsed().as_secs_f64() >= 0.1 {
+                last_title_update = std::time::Instant::now();
+                let cap_str = if cap > 0.0 {
+                    format!("{:.0} FPS [Classic Cap]", cap)
+                } else {
+                    "OFF [Uncapped]".to_string()
+                };
+                let click_qpc = LAST_CLICK_QPC.load(Ordering::Relaxed);
+                let click_str = if click_qpc > 0 {
+                    let mut freq = 0i64;
+                    let mut now_qpc = 0i64;
+                    let _ = windows::Win32::System::Performance::QueryPerformanceFrequency(&mut freq);
+                    let _ = windows::Win32::System::Performance::QueryPerformanceCounter(&mut now_qpc);
+                    if freq > 0 {
+                        let lat = (now_qpc - click_qpc) as f64 * 1000.0 / freq as f64;
+                        format!(" | Click Lag: {:.1}ms", lat)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                let title = format!(
+                    "iFrame Test [PID: {}] | {:.1} FPS ({:.1}ms) | In-Game Cap: {}{}\0",
+                    std::process::id(), current_fps, current_ft, cap_str, click_str
+                );
+                let title_u16: Vec<u16> = title.encode_utf16().collect();
+                let _ = SetWindowTextW(hwnd, PCWSTR(title_u16.as_ptr()));
             }
         }
     }

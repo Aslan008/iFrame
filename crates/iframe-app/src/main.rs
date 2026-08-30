@@ -1,6 +1,7 @@
 //! iframe.exe — control app: GUI (default) + CLI (inject / watch / limit / list).
 
 mod anticheat;
+mod bench;
 mod etw;
 mod injector;
 mod live;
@@ -11,6 +12,7 @@ mod ui;
 mod watch;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -26,6 +28,7 @@ fn main() {
         Some("watch") => cmd_watch(&args[1..]),
         Some("watch-etw") => cmd_watch_etw(&args[1..]),
         Some("limit") => cmd_limit(&args[1..]),
+        Some("bench") => bench::run_benchmark(),
         Some("--help") | Some("-h") | Some("help") => print_usage(),
         Some(other) => {
             eprintln!("unknown command: {other}\n");
@@ -186,8 +189,13 @@ fn cmd_inject(args: &[String]) {
     }
 }
 
-fn default_dll_path() -> PathBuf {
-    PathBuf::from("target/release/iframe_hook.dll")
+static ETW_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Console Ctrl handler: flip the stop flag so the trace is stopped cleanly
+/// (returning TRUE also prevents the default hard process kill).
+unsafe extern "system" fn etw_console_ctrl(_ctrl: u32) -> windows::core::BOOL {
+    ETW_STOP.store(true, Ordering::SeqCst);
+    windows::core::BOOL(1)
 }
 
 /// Telemetry-only observation via ETW — no injection, safe for anti-cheat
@@ -211,8 +219,14 @@ fn cmd_watch_etw(args: &[String]) {
     println!(
         "ETW telemetry-only watch on pid {pid} (no injection) — Ctrl+C to stop."
     );
+    unsafe {
+        let _ = windows::Win32::System::Console::SetConsoleCtrlHandler(
+            Some(etw_console_ctrl),
+            true,
+        );
+    }
     let mut last_total = 0u64;
-    loop {
+    while !ETW_STOP.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(2000));
         let stats = state.stats.lock().unwrap();
         let recent = stats.total - last_total;
@@ -224,10 +238,8 @@ fn cmd_watch_etw(args: &[String]) {
             stats.p50_us
         );
     }
-    #[allow(unreachable_code)]
-    {
-        watch.stop();
-    }
+    watch.stop();
+    println!("ETW watch stopped.");
 }
 
 fn cmd_watch(args: &[String]) {

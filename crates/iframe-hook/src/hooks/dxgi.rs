@@ -27,7 +27,7 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11DeviceContext,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGIFactory2, IDXGISwapChain, IDXGISwapChain1, DXGI_PRESENT_ALLOW_TEARING,
+    IDXGIDevice, IDXGISwapChain, IDXGISwapChain1, DXGI_PRESENT_ALLOW_TEARING,
     DXGI_SWAP_CHAIN_DESC, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
     DXGI_USAGE_RENDER_TARGET_OUTPUT,
@@ -370,6 +370,15 @@ unsafe extern "system" fn hooked_resize_buffers(
     flags: u32,
 ) -> i32 {
     let orig = ORIG_RESIZE_BUFFERS.load(Ordering::Acquire);
+    // К5: when we forced FRAME_LATENCY_WAITABLE_OBJECT at creation, the game's
+    // own ResizeBuffers call without the flag would fail — add it back.
+    let flags = if telemetry::config().force_waitable
+        && flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32 == 0
+    {
+        flags | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32
+    } else {
+        flags
+    };
     let hr = if orig.is_null() {
         0x8000_4005u32 as i32
     } else {
@@ -394,13 +403,24 @@ unsafe extern "system" fn hooked_create_swap_chain(
     out: *mut *mut c_void,
 ) -> i32 {
     let orig = ORIG_FACTORY_CREATE.load(Ordering::Acquire);
+    let forced = force_waitable_desc(desc);
+    let desc_ptr = forced.as_ref().map(|d| d as *const _).unwrap_or(desc);
     let hr = if orig.is_null() {
         0x8000_4005u32 as i32
     } else {
-        (std::mem::transmute::<*mut c_void, CreateSwapChainFn>(orig))(this, device, desc, out)
+        (std::mem::transmute::<*mut c_void, CreateSwapChainFn>(orig))(
+            this, device, desc_ptr, out,
+        )
     };
     if hr >= 0 && !out.is_null() && !(*out).is_null() && !desc.is_null() {
-        on_swapchain_created(*out, (*desc).Windowed.as_bool(), false, false, (*desc).BufferCount);
+        let d = &*desc_ptr;
+        on_swapchain_created(
+            *out,
+            d.Windowed.as_bool(),
+            d.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32 != 0,
+            d.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32 != 0,
+            d.BufferCount,
+        );
     }
     hr
 }
@@ -415,15 +435,24 @@ unsafe extern "system" fn hooked_create_for_hwnd(
     out: *mut *mut c_void,
 ) -> i32 {
     let orig = ORIG_FACTORY_FOR_HWND.load(Ordering::Acquire);
+    let forced = force_waitable_desc1(desc);
+    let desc_ptr = forced.as_ref().map(|d| d as *const _).unwrap_or(desc);
+    let in_flags = if !desc.is_null() { (*desc).Flags } else { 0 };
+    let out_flags = if !desc_ptr.is_null() { (*desc_ptr).Flags } else { 0 };
+    crate::log_line(&format!(
+        "hooked_create_for_hwnd: orig={:?} in_flags={:#x} out_flags={:#x} forced={}",
+        orig, in_flags, out_flags, forced.is_some()
+    ));
     let hr = if orig.is_null() {
         0x8000_4005u32 as i32
     } else {
         (std::mem::transmute::<*mut c_void, CreateSwapChainForHwndFn>(orig))(
-            this, device, hwnd, desc, fullscreen_desc, restrict_to_output, out,
+            this, device, hwnd, desc_ptr, fullscreen_desc, restrict_to_output, out,
         )
     };
+    crate::log_line(&format!("hooked_create_for_hwnd returned hr={:#x}", hr as u32));
     if hr >= 0 && !out.is_null() && !(*out).is_null() && !desc.is_null() {
-        let d = &*desc;
+        let d = &*desc_ptr;
         // fullscreen_desc == NULL → windowed; otherwise honour its Windowed.
         let windowed = fullscreen_desc.is_null() || (*fullscreen_desc).Windowed.as_bool();
         on_swapchain_created(
@@ -446,15 +475,17 @@ unsafe extern "system" fn hooked_create_for_core_window(
     out: *mut *mut c_void,
 ) -> i32 {
     let orig = ORIG_FACTORY_FOR_CORE_WINDOW.load(Ordering::Acquire);
+    let forced = force_waitable_desc1(desc);
+    let desc_ptr = forced.as_ref().map(|d| d as *const _).unwrap_or(desc);
     let hr = if orig.is_null() {
         0x8000_4005u32 as i32
     } else {
         (std::mem::transmute::<*mut c_void, CreateSwapChainForCoreWindowFn>(orig))(
-            this, device, window, desc, restrict_to_output, out,
+            this, device, window, desc_ptr, restrict_to_output, out,
         )
     };
     if hr >= 0 && !out.is_null() && !(*out).is_null() && !desc.is_null() {
-        let d = &*desc;
+        let d = &*desc_ptr;
         on_swapchain_created(
             *out,
             true, // CoreWindow swap chains are always composited (windowed)
@@ -474,15 +505,17 @@ unsafe extern "system" fn hooked_create_for_composition(
     out: *mut *mut c_void,
 ) -> i32 {
     let orig = ORIG_FACTORY_FOR_COMPOSITION.load(Ordering::Acquire);
+    let forced = force_waitable_desc1(desc);
+    let desc_ptr = forced.as_ref().map(|d| d as *const _).unwrap_or(desc);
     let hr = if orig.is_null() {
         0x8000_4005u32 as i32
     } else {
         (std::mem::transmute::<*mut c_void, CreateSwapChainForCompositionFn>(orig))(
-            this, device, desc, restrict_to_output, out,
+            this, device, desc_ptr, restrict_to_output, out,
         )
     };
     if hr >= 0 && !out.is_null() && !(*out).is_null() && !desc.is_null() {
-        let d = &*desc;
+        let d = &*desc_ptr;
         on_swapchain_created(
             *out,
             true, // composition swap chains are always windowed
@@ -492,6 +525,36 @@ unsafe extern "system" fn hooked_create_for_composition(
         );
     }
     hr
+}
+
+/// Per-game opt-in (`RuntimeConfig.force_waitable`): when the config asks for
+/// it and the game did not set FRAME_LATENCY_WAITABLE_OBJECT itself, return a
+/// DESC copy with the flag added (SpecialK-style). `None` = pass through.
+unsafe fn force_waitable_desc(desc: *const DXGI_SWAP_CHAIN_DESC) -> Option<DXGI_SWAP_CHAIN_DESC> {
+    if desc.is_null() || !telemetry::config().force_waitable {
+        return None;
+    }
+    if (*desc).Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32 != 0 {
+        return None;
+    }
+    let mut d = *desc;
+    d.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32;
+    Some(d)
+}
+
+/// Same for the DESC1 creation family.
+unsafe fn force_waitable_desc1(
+    desc: *const DXGI_SWAP_CHAIN_DESC1,
+) -> Option<DXGI_SWAP_CHAIN_DESC1> {
+    if desc.is_null() || !telemetry::config().force_waitable {
+        return None;
+    }
+    if (*desc).Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32 != 0 {
+        return None;
+    }
+    let mut d = *desc;
+    d.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32;
+    Some(d)
 }
 
 /// A new swap chain appeared: it becomes the active one and its capabilities

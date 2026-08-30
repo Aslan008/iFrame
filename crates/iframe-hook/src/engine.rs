@@ -27,11 +27,8 @@ struct Engine {
 }
 
 fn pacer_config(cfg: &RuntimeConfig) -> PacerConfig {
-    PacerConfig {
-        target_fps: if cfg.target_fps > 0.0 { cfg.target_fps } else { 60.0 },
-        mode: cfg.mode,
-        ..Default::default()
-    }
+    let fps = if cfg.target_fps > 0.0 { cfg.target_fps } else { 60.0 };
+    PacerConfig::for_mode(cfg.mode, fps)
 }
 
 /// Run one pacing step. Returns `(release_qpc, decision)` when the frame was

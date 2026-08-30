@@ -9,20 +9,17 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, Interface, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Direct3D9::{
     Direct3DCreate9, IDirect3DDevice9, D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DDEVTYPE_HAL,
     D3DFORMAT, D3DPRESENT_PARAMETERS, D3DSWAPEFFECT_DISCARD, D3D_SDK_VERSION,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::Sleep;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DispatchMessageW, GetMessageW, PeekMessageW, RegisterClassW, ShowWindow,
+    CreateWindowExW, DispatchMessageW, PeekMessageW, RegisterClassW, ShowWindow,
     TranslateMessage, CS_HREDRAW, CS_VREDRAW, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WNDCLASSW,
     WM_QUIT, WS_OVERLAPPEDWINDOW,
 };
-
-const WINDOW_TITLE: &str = "iFrame Test D3D9";
 
 struct Args {
     cpu_ms: f64,
@@ -78,7 +75,7 @@ unsafe extern "system" fn wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    windows::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, msg, wparam, lparam)
+    unsafe { windows::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 fn run_window(args: Args) {

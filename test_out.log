@@ -1,0 +1,3 @@
+PID=15016
+d3d11_test_app: 640x360, vsync=0, cpu_ms=0.00, tearing=true, delay=3
+delaying swap chain creation by 3s ...
