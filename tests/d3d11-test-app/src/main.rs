@@ -254,6 +254,7 @@ fn run_window(args: Args) {
         let mut last_fps_time = std::time::Instant::now();
         let mut current_fps = 0.0f64;
         let mut current_ft = 0.0f64;
+        let _ = current_ft;
         let mut target_qpc = 0i64;
 
         loop {

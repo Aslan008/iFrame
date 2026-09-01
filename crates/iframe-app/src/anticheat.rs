@@ -7,7 +7,7 @@
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
-    MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPPROCESS,
+    MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
 };
 
 /// Process-image names (lowercase, no path) of known anti-cheat services.
@@ -108,7 +108,7 @@ pub fn check_process(pid: u32) -> Result<(), String> {
     }
 
     // 2. loaded modules (an anti-cheat DLL can be loaded into ANY game)
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid) }
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) }
         .map_err(|e| format!("module snapshot: {e}"))?;
     let mut entry = MODULEENTRY32W {
         dwSize: std::mem::size_of::<MODULEENTRY32W>() as u32,

@@ -14,11 +14,11 @@
 // lint becomes a hard error in a future Rust edition.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-mod engine;
-mod hooks;
-mod telemetry;
-mod timing;
-mod vblank;
+pub mod engine;
+pub mod hooks;
+pub mod telemetry;
+pub mod timing;
+pub mod vblank;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use windows::core::BOOL;

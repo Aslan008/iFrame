@@ -54,7 +54,7 @@ fn print_second(present_starts: &[i64], freq: i64) {
         .windows(2)
         .map(|w| (w[1] - w[0]) as f64 * 1e6 / freq as f64)
         .collect();
-    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let p50 = percentile(&diffs, 0.50);
     let p99 = percentile(&diffs, 0.99);
     let max = diffs.last().copied().unwrap_or(0.0);

@@ -32,7 +32,9 @@ pub fn qpc_now() -> i64 {
 /// Spin-wait until `target_qpc` (accuracy < 10 µs, burns CPU — final approach only).
 #[inline]
 pub fn spin_until(target_qpc: i64) {
-    while qpc_now() < target_qpc {
+    let max_ticks = qpc_frequency() / 10; // 100 ms safety cap against infinite spin
+    let deadline = qpc_now().saturating_add(max_ticks).min(target_qpc);
+    while qpc_now() < deadline {
         std::hint::spin_loop();
     }
 }

@@ -1,15 +1,6 @@
 //! iframe.exe — control app: GUI (default) + CLI (inject / watch / limit / list).
 
-mod anticheat;
-mod bench;
-mod etw;
-mod injector;
-mod live;
-mod profiles;
-mod sm_host;
-mod tray;
-mod ui;
-mod watch;
+use iframe_app::{bench, etw, injector, live, sm_host, ui, watch};
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

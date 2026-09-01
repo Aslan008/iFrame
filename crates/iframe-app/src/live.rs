@@ -71,22 +71,27 @@ impl SharedState {
 }
 
 /// Percentile `q` (0..1) of an ascending-sorted slice (same method as watch.rs).
-pub(crate) fn percentile(sorted: &[f64], q: f64) -> f64 {
+pub fn percentile(sorted: &[f64], q: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
-    let idx = ((sorted.len() as f64 - 1.0) * q).round() as usize;
+    let q_clamped = if q.is_finite() { q.clamp(0.0, 1.0) } else { 0.0 };
+    let idx = ((sorted.len() as f64 - 1.0) * q_clamped).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
 }
 
 /// FPS / p50 / p99 (µs) over one side-bucket window. Fewer than 2 samples → zeros.
 pub fn compute_side_stats(samples: &VecDeque<(f64, f64)>) -> (f64, f64, f64) {
-    if samples.len() < 2 {
+    let mut sorted: Vec<f64> = samples
+        .iter()
+        .map(|(_, ft)| *ft)
+        .filter(|ft| ft.is_finite() && *ft >= 0.0)
+        .collect();
+    if sorted.len() < 2 {
         return (0.0, 0.0, 0.0);
     }
-    let mean = samples.iter().map(|(_, ft)| *ft).sum::<f64>() / samples.len() as f64;
-    let mut sorted: Vec<f64> = samples.iter().map(|(_, ft)| *ft).collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
     let p50 = percentile(&sorted, 0.50);
     let p99 = percentile(&sorted, 0.99);
     (if mean > 0.0 { 1e6 / mean } else { 0.0 }, p50, p99)
@@ -104,8 +109,15 @@ struct SideBucket {
 
 /// Median of an unsorted queue.
 fn p50_of(v: &VecDeque<f64>) -> f64 {
-    let mut s: Vec<f64> = v.iter().copied().collect();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut s: Vec<f64> = v
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite() && *x >= 0.0)
+        .collect();
+    if s.is_empty() {
+        return 0.0;
+    }
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     percentile(&s, 0.50)
 }
 
@@ -275,7 +287,7 @@ fn worker(pid: u32, state: Arc<SharedState>) {
         let (fps, p50, p99) = if recent.len() >= 2 {
             let mean = recent.iter().sum::<f64>() / recent.len() as f64;
             let mut sorted = recent.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let p50 = sorted[sorted.len() / 2];
             let p99 = sorted[(sorted.len() as f64 * 0.99) as usize % sorted.len()];
             (1e6 / mean, p50, p99)

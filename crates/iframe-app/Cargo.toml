@@ -3,6 +3,10 @@ name = "iframe-app"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "iframe_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "iframe"
 path = "src/main.rs"

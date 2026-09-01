@@ -179,13 +179,17 @@ impl SharedRing {
     pub fn push(&self, rec: &TelemetryFrame) -> bool {
         let header = self.header();
         let cap = self.capacity();
+        if cap == 0 {
+            return false;
+        }
         let head = header.head.load(Ordering::Acquire);
         let tail = header.tail.load(Ordering::Acquire);
-        if head - tail >= cap as u64 {
+        if head.saturating_sub(tail) >= cap as u64 {
             header.dropped.fetch_add(1, Ordering::Relaxed);
             return false;
         }
-        let slot = (head & header.capacity_mask.load(Ordering::Relaxed)) as usize;
+        let mask = (cap - 1) as u64;
+        let slot = (head & mask) as usize;
         unsafe {
             let dst = self.records_base().add(slot);
             std::ptr::write_unaligned(dst, *rec);
@@ -197,17 +201,22 @@ impl SharedRing {
     /// Consumer side: pop the oldest record, if any.
     pub fn pop(&self) -> Option<TelemetryFrame> {
         let header = self.header();
+        let cap = self.capacity();
+        if cap == 0 {
+            return None;
+        }
         let head = header.head.load(Ordering::Acquire);
         let mut tail = header.tail.load(Ordering::Acquire);
-        let cap = self.capacity() as u64;
-        if head > tail + cap {
-            tail = head.saturating_sub(cap);
+        let cap_u64 = cap as u64;
+        if head > tail + cap_u64 {
+            tail = head.saturating_sub(cap_u64);
             header.tail.store(tail, Ordering::Release);
         }
         if tail >= head {
             return None;
         }
-        let slot = (tail & header.capacity_mask.load(Ordering::Relaxed)) as usize;
+        let mask = (cap - 1) as u64;
+        let slot = (tail & mask) as usize;
         let rec = unsafe { std::ptr::read_unaligned(self.records_base().add(slot)) };
         header.tail.store(tail + 1, Ordering::Release);
         Some(rec)

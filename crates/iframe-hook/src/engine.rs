@@ -50,40 +50,54 @@ pub fn pace(
         other => other,
     };
 
-    let Ok(mut guard) = ENGINE.try_lock() else {
-        return None; // another present in flight — never block the hot path
-    };
-    let engine = guard.get_or_insert_with(|| Engine {
-        pacer: JitPacer::new(pacer_config(cfg), qpc_frequency()),
-        cfg: *cfg,
-        logged: 0,
-    });
-    if engine.cfg != *cfg {
-        engine.pacer.set_config(pacer_config(cfg));
-        engine.cfg = *cfg;
-    }
+    let const_log_frames: u32 = 12;
+    let (decision, should_log) = {
+        let Ok(mut guard) = ENGINE.try_lock() else {
+            return None; // another present in flight — never block the hot path
+        };
+        let engine = guard.get_or_insert_with(|| Engine {
+            pacer: JitPacer::new(pacer_config(cfg), qpc_frequency()),
+            cfg: *cfg,
+            logged: 0,
+        });
+        if engine.cfg != *cfg {
+            engine.pacer.set_config(pacer_config(cfg));
+            engine.cfg = *cfg;
+        }
 
-    let decision = engine.pacer.on_present_complete(t_start, t_end, hint);
-    if decision.stats.bypass {
-        // Inert: release immediately, keep the estimator fed.
-        engine.pacer.mark_released(t_end);
-        return Some((t_end, decision));
-    }
+        let decision = engine.pacer.on_present_complete(t_start, t_end, hint);
+        if decision.stats.bypass {
+            // Inert: release immediately, keep the estimator fed.
+            engine.pacer.mark_released(t_end);
+            return Some((t_end, decision));
+        }
+
+        let should_log = if engine.logged < const_log_frames {
+            engine.logged += 1;
+            Some(engine.logged)
+        } else {
+            None
+        };
+        (decision, should_log)
+    };
+
     let sleeper = SLEEPER.get_or_init(HighResSleeper::new);
     // Safety cap: a sane pacing wait is < 1 frame interval (≤ 100 ms even at
     // 10 FPS). Anything larger means the schedule is broken — clamp and log.
     sleeper.sleep_until_capped(decision.wake_qpc, 100_000.0);
     let release = crate::timing::qpc_now();
-    engine.pacer.mark_released(release);
 
-    // First paced frames: log the schedule for diagnosis.
-    const LOG_FRAMES: u32 = 12;
-    if engine.logged < LOG_FRAMES {
-        engine.logged += 1;
+    if let Ok(mut guard) = ENGINE.try_lock() {
+        if let Some(engine) = guard.as_mut() {
+            engine.pacer.mark_released(release);
+        }
+    }
+
+    if let Some(logged) = should_log {
         crate::log_line(&format!(
             "pace #{}/{}: d={:.0}µs ema={:.0}µs margin={:.0}µs sleep={:.0}µs late={} hint={:?}",
-            engine.logged,
-            LOG_FRAMES,
+            logged,
+            const_log_frames,
             decision.stats.frame_duration_us,
             decision.stats.ema_duration_us,
             decision.stats.safety_margin_us,

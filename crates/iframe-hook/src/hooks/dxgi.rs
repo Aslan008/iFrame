@@ -20,7 +20,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use windows::core::{w, Interface, PCWSTR};
-use windows::Win32::Foundation::{HWND, HMODULE, RECT, TRUE};
+use windows::Win32::Foundation::{HMODULE, HWND, TRUE};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDeviceAndSwapChain, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, ID3D11Device,
@@ -30,7 +30,7 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGISwapChain, IDXGISwapChain1, DXGI_PRESENT_ALLOW_TEARING,
     DXGI_SWAP_CHAIN_DESC, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, DXGI_PRESENT_PARAMETERS,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_MODE_DESC, DXGI_MODE_SCALING_UNSPECIFIED,
@@ -78,8 +78,7 @@ type Present1Fn = unsafe extern "system" fn(
     this: *mut c_void,
     sync_interval: u32,
     flags: u32,
-    dirty_rects: *const RECT,
-    dirty_rects_count: u32,
+    present_parameters: *const DXGI_PRESENT_PARAMETERS,
 ) -> i32;
 type ResizeBuffersFn =
     unsafe extern "system" fn(this: *mut c_void, u32, u32, u32, u32, u32) -> i32;
@@ -295,8 +294,7 @@ unsafe extern "system" fn hooked_present1(
     this: *mut c_void,
     sync_interval: u32,
     flags: u32,
-    dirty_rects: *const RECT,
-    dirty_rects_count: u32,
+    present_parameters: *const DXGI_PRESENT_PARAMETERS,
 ) -> i32 {
     let t_start = crate::timing::qpc_now();
     let cfg = telemetry::config();
@@ -315,8 +313,7 @@ unsafe extern "system" fn hooked_present1(
             this,
             sync,
             present_flags,
-            dirty_rects,
-            dirty_rects_count,
+            present_parameters,
         )
     };
     let t_end = crate::timing::qpc_now();
@@ -333,10 +330,18 @@ unsafe extern "system" fn hooked_present1(
     hr
 }
 
+/// Set cached capabilities directly for unit testing.
+pub fn set_caps_for_test(windowed: bool, tearing: bool, waitable: bool) {
+    CAPS_WINDOWED.store(windowed, Ordering::Release);
+    CAPS_TEARING.store(tearing, Ordering::Release);
+    CAPS_WAITABLE.store(waitable, Ordering::Release);
+    CAPS_VALID.store(true, Ordering::Release);
+}
+
 /// К1 sync/flags override for paced presents. `enabled` mirrors the app's
 /// "override VSync" checkbox — off means the game's own present args pass
 /// through untouched.
-unsafe fn override_sync(sync_interval: u32, flags: u32, enabled: bool) -> (u32, u32) {
+pub unsafe fn override_sync(sync_interval: u32, flags: u32, enabled: bool) -> (u32, u32) {
     if !enabled {
         return (sync_interval, flags);
     }
@@ -530,7 +535,7 @@ unsafe extern "system" fn hooked_create_for_composition(
 /// Per-game opt-in (`RuntimeConfig.force_waitable`): when the config asks for
 /// it and the game did not set FRAME_LATENCY_WAITABLE_OBJECT itself, return a
 /// DESC copy with the flag added (SpecialK-style). `None` = pass through.
-unsafe fn force_waitable_desc(desc: *const DXGI_SWAP_CHAIN_DESC) -> Option<DXGI_SWAP_CHAIN_DESC> {
+pub unsafe fn force_waitable_desc(desc: *const DXGI_SWAP_CHAIN_DESC) -> Option<DXGI_SWAP_CHAIN_DESC> {
     if desc.is_null() || !telemetry::config().force_waitable {
         return None;
     }
@@ -543,7 +548,7 @@ unsafe fn force_waitable_desc(desc: *const DXGI_SWAP_CHAIN_DESC) -> Option<DXGI_
 }
 
 /// Same for the DESC1 creation family.
-unsafe fn force_waitable_desc1(
+pub unsafe fn force_waitable_desc1(
     desc: *const DXGI_SWAP_CHAIN_DESC1,
 ) -> Option<DXGI_SWAP_CHAIN_DESC1> {
     if desc.is_null() || !telemetry::config().force_waitable {

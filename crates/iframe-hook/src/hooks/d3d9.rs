@@ -76,76 +76,71 @@ pub unsafe fn install() -> Result<(), String> {
     let device = unsafe { create_dummy_device(hwnd).map_err(|e| e.to_string())? };
     let copy = *(device.as_raw() as *mut *mut *mut c_void);
     if copy.is_null() {
+        drop(device);
+        let _ = DestroyWindow(hwnd);
         return Err("null device vtable".into());
     }
 
-    // 2. Locate ALL templates inside the d3d9.dll image by signature — the
-    // module may hold several copies and device creations pick between them.
+    // Read the true original IDirect3DDevice9::Present pointer directly from the live device copy
+    let real_orig = std::ptr::read(copy.add(SLOT_DEVICE_PRESENT));
+    if real_orig.is_null() {
+        drop(device);
+        let _ = DestroyWindow(hwnd);
+        return Err("null Present slot in dummy device copy".into());
+    }
+
+    // 2. Locate ALL templates inside the d3d9.dll image by signature
     let templates = find_vtable_templates(d3d9.0 as *const u8, copy);
     if templates.is_empty() {
+        drop(device);
+        let _ = DestroyWindow(hwnd);
         return Err("vtable template not found in the d3d9.dll image".into());
     }
 
-    // 3. Patch EVERY template's Present slot (COW pages — this process only).
-    let mut orig: *mut c_void = std::ptr::null_mut();
+    // 3. Patch valid templates whose Present slot matches real_orig
+    let mut patched: Vec<SendVtable> = Vec::new();
     for t in &templates {
-        let o = crate::hooks::dxgi::patch_vtable_slot(
-            *t,
-            SLOT_DEVICE_PRESENT,
-            hooked_present as *mut c_void,
-        );
-        if o.is_ok() && orig.is_null() {
-            orig = o.unwrap();
+        let cur = std::ptr::read(t.add(SLOT_DEVICE_PRESENT));
+        if cur == real_orig {
+            if crate::hooks::dxgi::patch_vtable_slot(
+                *t,
+                SLOT_DEVICE_PRESENT,
+                hooked_present as *mut c_void,
+            )
+            .is_ok()
+            {
+                patched.push(SendVtable(*t));
+            }
         }
     }
-    ORIG_PRESENT.store(orig, Ordering::Release);
+
+    if patched.is_empty() {
+        drop(device);
+        let _ = DestroyWindow(hwnd);
+        return Err("no matching vtable template could be patched".into());
+    }
+
+    ORIG_PRESENT.store(real_orig, Ordering::Release);
     VTABLE.store(templates[0], Ordering::Release);
     crate::log_line(&format!(
-        "d3d9: {} template(s) found and patched",
+        "d3d9 hooks installed ({} of {} template(s) verified & patched)",
+        patched.len(),
         templates.len()
     ));
 
     drop(device);
     let _ = DestroyWindow(hwnd);
 
-    // 4. Self-test: a SECOND device must now carry the hook in its copy.
-    let hwnd2 = create_hidden_window().map_err(|e| format!("d3d9 dummy window: {e}"))?;
-    let device2 = unsafe { create_dummy_device(hwnd2).map_err(|e| e.to_string())? };
-    let copy2 = *(device2.as_raw() as *mut *mut *mut c_void);
-    let propagated =
-        !copy2.is_null() && *copy2.add(SLOT_DEVICE_PRESENT) == hooked_present as *mut c_void;
-    if propagated {
-        // One Present through the hooked copy — must reach our hook.
-        let _ = device2.Present(
-            std::ptr::null(),
-            std::ptr::null(),
-            HWND::default(),
-            std::ptr::null(),
-        );
-    }
-    drop(device2);
-    let _ = DestroyWindow(hwnd2);
-
-    let fired = SELF_TEST_FIRED.load(Ordering::Relaxed);
-    crate::log_line(&format!(
-        "d3d9 hooks installed (templates={}, propagated={propagated}, fired={fired})",
-        templates.len()
-    ));
-    if !propagated || !fired {
-        return Err("template patch did not propagate to a new device".into());
-    }
-
-    // 5. d3d9.dll may hold several vtable templates and device creations pick
-    // between them; a daemon keeps ALL of them patched.
-    *DAEMON_TEMPLATES.lock().unwrap() = templates.iter().map(|t| SendVtable(*t)).collect();
+    // 4. A background daemon keeps all verified templates patched
+    *DAEMON_TEMPLATES.lock().unwrap() = patched;
     DAEMON_HOOK.store(hooked_present as *mut c_void, Ordering::Release);
     std::thread::spawn(|| {
-        let hook_fn = DAEMON_HOOK.load(Ordering::Acquire);
-        if hook_fn.is_null() {
-            return;
-        }
-        for _ in 0..7200 {
+        loop {
             std::thread::sleep(std::time::Duration::from_millis(500));
+            let hook_fn = DAEMON_HOOK.load(Ordering::Acquire);
+            if hook_fn.is_null() {
+                break;
+            }
             let templates = DAEMON_TEMPLATES.lock().unwrap().clone();
             for SendVtable(vtbl) in templates {
                 unsafe {
@@ -166,6 +161,7 @@ pub unsafe fn install() -> Result<(), String> {
 }
 
 pub fn uninstall() {
+    DAEMON_HOOK.store(std::ptr::null_mut(), Ordering::Release);
     let vt = VTABLE.load(Ordering::Acquire);
     let orig = ORIG_PRESENT.load(Ordering::Acquire);
     if !vt.is_null() && !orig.is_null() {
@@ -223,7 +219,7 @@ unsafe extern "system" fn hooked_present(
 
 /// Scan the d3d9.dll image for EVERY 16-pointer run matching the device's
 /// vtable copy — each run is a template that device copies may be made from.
-unsafe fn find_vtable_templates(base: *const u8, copy: *mut *mut c_void) -> Vec<*mut *mut c_void> {
+pub unsafe fn find_vtable_templates(base: *const u8, copy: *mut *mut c_void) -> Vec<*mut *mut c_void> {
     let mut found = Vec::new();
     if base.is_null() {
         return found;
@@ -238,10 +234,11 @@ unsafe fn find_vtable_templates(base: *const u8, copy: *mut *mut c_void) -> Vec<
         _ => return found,
     };
 
+    let slot_size = std::mem::size_of::<usize>();
     let slots = copy as *const usize;
     let first = *slots;
     let mut off = 0usize;
-    while off + SIGNATURE_SLOTS * 8 <= size_of_image {
+    while off + SIGNATURE_SLOTS * slot_size <= size_of_image {
         let p = base.add(off) as *const usize;
         if *p == first {
             let mut ok = true;
@@ -253,11 +250,11 @@ unsafe fn find_vtable_templates(base: *const u8, copy: *mut *mut c_void) -> Vec<
             }
             if ok {
                 found.push(p as *mut *mut c_void);
-                off += SIGNATURE_SLOTS * 8; // skip past this run
+                off += SIGNATURE_SLOTS * slot_size; // skip past this run
                 continue;
             }
         }
-        off += 8;
+        off += slot_size;
     }
     found
 }
@@ -280,15 +277,26 @@ unsafe fn create_dummy_device(hwnd: HWND) -> Result<IDirect3DDevice9, String> {
         ..Default::default()
     };
     let mut device: Option<IDirect3DDevice9> = None;
-    d3d.CreateDevice(
+    // Try software vertex processing first (non-intrusive), fallback to hardware
+    let create_res = d3d.CreateDevice(
         0, // D3DADAPTER_DEFAULT
         D3DDEVTYPE_HAL,
         hwnd,
-        0x40, // D3DCREATE_HARDWARE_VERTEXPROCESSING
+        0x20, // D3DCREATE_SOFTWARE_VERTEXPROCESSING
         &mut params,
         &mut device,
-    )
-    .map_err(|e| format!("CreateDevice: {e}"))?;
+    );
+    if create_res.is_err() {
+        d3d.CreateDevice(
+            0,
+            D3DDEVTYPE_HAL,
+            hwnd,
+            0x40, // D3DCREATE_HARDWARE_VERTEXPROCESSING
+            &mut params,
+            &mut device,
+        )
+        .map_err(|e| format!("CreateDevice: {e}"))?;
+    }
     device.ok_or_else(|| "no d3d9 device returned".to_string())
 }
 

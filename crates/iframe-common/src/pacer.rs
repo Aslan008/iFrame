@@ -12,12 +12,18 @@
 /// QPC → microseconds conversion for a given frequency.
 #[inline]
 pub fn qpc_to_us(ticks: i64, freq: i64) -> f64 {
+    if freq <= 0 {
+        return 0.0;
+    }
     ticks as f64 * 1_000_000.0 / freq as f64
 }
 
 /// Microseconds → QPC ticks conversion for a given frequency.
 #[inline]
 pub fn us_to_qpc(us: f64, freq: i64) -> i64 {
+    if freq <= 0 || !us.is_finite() {
+        return 0;
+    }
     (us * freq as f64 / 1_000_000.0).round() as i64
 }
 
@@ -235,12 +241,18 @@ impl JitPacer {
             };
         }
 
-        let interval_us = 1_000_000.0 / self.cfg.target_fps.max(0.1);
+        let fps = if self.cfg.target_fps.is_finite() && self.cfg.target_fps >= 0.1 {
+            self.cfg.target_fps
+        } else {
+            0.1
+        };
+        let interval_us = 1_000_000.0 / fps;
 
         // Update the estimator, clamping outliers so a single stall does not
         // poison the EMA (a stall longer than 4 intervals is a hitch, not a
         // trend).
-        let d_clamped = d_us.clamp(50.0, interval_us * 4.0);
+        let max_d = (interval_us * 4.0).max(50.0);
+        let d_clamped = d_us.clamp(50.0, max_d);
         let delta = d_clamped - self.ema_us;
         self.ema_us = if self.frames == 1 {
             d_clamped
@@ -286,82 +298,103 @@ impl JitPacer {
                 };
                 (wake.max(present_end_qpc), target, 1, late)
             }
-            PacerMode::FixedVsync => match hint {
-                None => {
-                    // No display tick info: degrade to VRR-style pacing.
-                    let interval_qpc = us_to_qpc(interval_us, self.freq);
-                    let mut target = self.last_target_qpc + interval_qpc;
-                    let mut late = false;
-                    while target - lead_qpc < present_end_qpc {
-                        target += interval_qpc;
-                        late = true;
+            PacerMode::FixedVsync => {
+                let valid_hint = hint.and_then(|h| {
+                    if !h.refresh_hz.is_finite() || h.refresh_hz <= 1.0 {
+                        return None;
                     }
-                    let wake = if overloaded {
-                        present_end_qpc
-                    } else {
-                        target - lead_qpc
-                    };
-                    (wake.max(present_end_qpc), target, 1, late)
+                    if h.last_vblank_qpc <= 0 {
+                        return None;
+                    }
+                    let max_ahead = us_to_qpc(1_000_000.0, self.freq);
+                    if h.last_vblank_qpc > present_end_qpc.saturating_add(max_ahead) {
+                        return None;
+                    }
+                    Some(h)
+                });
+
+                match valid_hint {
+                    None => {
+                        // No display tick info or invalid hint: degrade to VRR-style pacing.
+                        let interval_qpc = us_to_qpc(interval_us, self.freq);
+                        let mut target = self.last_target_qpc + interval_qpc;
+                        let mut late = false;
+                        while target - lead_qpc < present_end_qpc {
+                            target += interval_qpc;
+                            late = true;
+                        }
+                        let wake = if overloaded {
+                            present_end_qpc
+                        } else {
+                            target - lead_qpc
+                        };
+                        (wake.max(present_end_qpc), target, 1, late)
+                    }
+                    Some(h) => {
+                        let refresh_hz = h.refresh_hz;
+                        // Effective target never exceeds the refresh rate.
+                        let effective_fps = if self.cfg.target_fps.is_finite() && self.cfg.target_fps > 0.0 {
+                            self.cfg.target_fps.min(refresh_hz).max(0.1)
+                        } else {
+                            refresh_hz
+                        };
+                        let refresh_int_us = 1_000_000.0 / refresh_hz;
+                        let refresh_int_qpc = us_to_qpc(refresh_int_us, self.freq).max(1);
+
+                        // Advance the logical hint index by the number of real
+                        // vblanks that elapsed since the previous hint.
+                        if self.frames > 1 && self.hint_qpc != 0 {
+                            let delta = ((h.last_vblank_qpc.saturating_sub(self.hint_qpc)) as f64
+                                / refresh_int_qpc as f64)
+                                .round() as i64;
+                            self.hint_index += delta.max(0);
+                        }
+                        self.hint_qpc = h.last_vblank_qpc;
+
+                        // Bresenham cadence: advance by `refresh/target` vblanks
+                        // per frame on average.
+                        let step = refresh_hz / effective_fps;
+                        self.bres_acc += step;
+                        let mut n = self.bres_acc.floor() as i64;
+                        self.bres_acc -= n as f64;
+                        if n < 1 {
+                            n = 1;
+                        }
+
+                        let candidate_idx = self.last_target_index + n;
+                        // Earliest vblank that is still feasible:
+                        // its QPC must be >= present_end + lead.
+                        let min_idx = self.hint_index
+                            + ((present_end_qpc.saturating_add(lead_qpc).saturating_sub(h.last_vblank_qpc)) as f64
+                                / refresh_int_qpc as f64)
+                                .ceil() as i64;
+                        let mut late = false;
+                        let mut target_idx = candidate_idx;
+                        if target_idx < min_idx {
+                            target_idx = min_idx;
+                            late = true;
+                        }
+                        if overloaded {
+                            target_idx = min_idx;
+                        }
+
+                        let target_qpc = h.last_vblank_qpc.saturating_add(
+                            (target_idx.saturating_sub(self.hint_index)).saturating_mul(refresh_int_qpc),
+                        );
+                        let wake = if overloaded {
+                            present_end_qpc
+                        } else {
+                            target_qpc.saturating_sub(lead_qpc)
+                        };
+                        (
+                            wake.max(present_end_qpc),
+                            target_qpc,
+                            target_idx - self.last_target_index,
+                            late,
+                        )
+                    }
                 }
-                Some(h) => {
-                    let refresh_hz = if h.refresh_hz > 1.0 { h.refresh_hz } else { 60.0 };
-                    // Effective target never exceeds the refresh rate.
-                    let effective_fps = self.cfg.target_fps.min(refresh_hz);
-                    let refresh_int_us = 1_000_000.0 / refresh_hz;
-                    let refresh_int_qpc = us_to_qpc(refresh_int_us, self.freq);
-
-                    // Advance the logical hint index by the number of real
-                    // vblanks that elapsed since the previous hint.
-                    if self.frames > 1 && self.hint_qpc != 0 {
-                        let delta = ((h.last_vblank_qpc - self.hint_qpc) as f64
-                            / refresh_int_qpc as f64)
-                            .round() as i64;
-                        self.hint_index += delta.max(0);
-                    }
-                    self.hint_qpc = h.last_vblank_qpc;
-
-                    // Bresenham cadence: advance by `refresh/target` vblanks
-                    // per frame on average.
-                    let step = refresh_hz / effective_fps;
-                    self.bres_acc += step;
-                    let mut n = self.bres_acc.floor() as i64;
-                    self.bres_acc -= n as f64;
-                    if n < 1 {
-                        n = 1;
-                    }
-
-                    let candidate_idx = self.last_target_index + n;
-                    // Earliest vblank that is still feasible:
-                    // its QPC must be >= present_end + lead.
-                    let min_idx = self.hint_index
-                        + ((present_end_qpc + lead_qpc - h.last_vblank_qpc) as f64
-                            / refresh_int_qpc as f64)
-                            .ceil() as i64;
-                    let mut late = false;
-                    let mut target_idx = candidate_idx;
-                    if target_idx < min_idx {
-                        target_idx = min_idx;
-                        late = true;
-                    }
-                    if overloaded {
-                        target_idx = min_idx;
-                    }
-
-                    let target_qpc =
-                        h.last_vblank_qpc + (target_idx - self.hint_index) * refresh_int_qpc;
-                    let wake = if overloaded {
-                        present_end_qpc
-                    } else {
-                        target_qpc - lead_qpc
-                    };
-                    (
-                        wake.max(present_end_qpc),
-                        target_qpc,
-                        target_idx - self.last_target_index,
-                        late,
-                    )
-                }
-            },
+            }
         };
 
         // Persist anchors.

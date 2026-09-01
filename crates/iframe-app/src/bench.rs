@@ -20,21 +20,89 @@ fn qpc_frequency() -> i64 {
     if f <= 0 { 10_000_000 } else { f }
 }
 
-struct PhaseResult {
+pub struct PhaseResult {
+    pub name: &'static str,
+    pub total_frames: usize,
+    pub fps: f64,
+    pub ft_mean_ms: f64,
+    pub ft_p50_ms: f64,
+    pub ft_p99_ms: f64,
+    pub ft_min_ms: f64,
+    pub ft_max_ms: f64,
+    pub ft_std_ms: f64,
+    pub ft_jitter_ms: f64,
+    pub present_hold_p50_ms: f64,
+    pub present_hold_max_ms: f64,
+    pub pacing_wait_p50_ms: f64,
+    pub late_frames: usize,
+}
+
+pub fn compute_phase_metrics(
     name: &'static str,
-    total_frames: usize,
-    fps: f64,
-    ft_mean_ms: f64,
-    ft_p50_ms: f64,
-    ft_p99_ms: f64,
-    ft_min_ms: f64,
-    ft_max_ms: f64,
-    ft_std_ms: f64,
-    ft_jitter_ms: f64,
-    present_hold_p50_ms: f64,
-    present_hold_max_ms: f64,
-    pacing_wait_p50_ms: f64,
+    ft_list: &[f64],
+    hold_list: &[f64],
+    wait_list: &[f64],
     late_frames: usize,
+) -> PhaseResult {
+    let count = ft_list.len();
+    if count == 0 {
+        return PhaseResult {
+            name,
+            total_frames: 0,
+            fps: 0.0,
+            ft_mean_ms: 0.0,
+            ft_p50_ms: 0.0,
+            ft_p99_ms: 0.0,
+            ft_min_ms: 0.0,
+            ft_max_ms: 0.0,
+            ft_std_ms: 0.0,
+            ft_jitter_ms: 0.0,
+            present_hold_p50_ms: 0.0,
+            present_hold_max_ms: 0.0,
+            pacing_wait_p50_ms: 0.0,
+            late_frames: 0,
+        };
+    }
+
+    let mean = ft_list.iter().sum::<f64>() / count as f64;
+    let variance = ft_list.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / count as f64;
+    let std_dev = variance.sqrt();
+
+    let mut sorted_ft = ft_list.to_vec();
+    sorted_ft.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p50 = percentile(&sorted_ft, 0.50);
+    let p99 = percentile(&sorted_ft, 0.99);
+    let min = sorted_ft.first().copied().unwrap_or(0.0);
+    let max = sorted_ft.last().copied().unwrap_or(0.0);
+    let jitter = (p99 - p50).max(0.0);
+
+    let mut sorted_hold = hold_list.to_vec();
+    sorted_hold.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let hold_p50 = percentile(&sorted_hold, 0.50);
+    let hold_max = sorted_hold.last().copied().unwrap_or(0.0);
+
+    let mut sorted_wait = wait_list.to_vec();
+    sorted_wait.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let wait_p50 = percentile(&sorted_wait, 0.50);
+
+    let fps = if mean > 0.0 { 1000.0 / mean } else { 0.0 };
+
+    PhaseResult {
+        name,
+        total_frames: count,
+        fps,
+        ft_mean_ms: mean,
+        ft_p50_ms: p50,
+        ft_p99_ms: p99,
+        ft_min_ms: min,
+        ft_max_ms: max,
+        ft_std_ms: std_dev,
+        ft_jitter_ms: jitter,
+        present_hold_p50_ms: hold_p50,
+        present_hold_max_ms: hold_max,
+        pacing_wait_p50_ms: wait_p50,
+        late_frames,
+    }
 }
 
 fn collect_phase(
@@ -77,65 +145,7 @@ fn collect_phase(
         std::thread::sleep(Duration::from_millis(15));
     }
 
-    let count = ft_list.len();
-    if count == 0 {
-        return PhaseResult {
-            name,
-            total_frames: 0,
-            fps: 0.0,
-            ft_mean_ms: 0.0,
-            ft_p50_ms: 0.0,
-            ft_p99_ms: 0.0,
-            ft_min_ms: 0.0,
-            ft_max_ms: 0.0,
-            ft_std_ms: 0.0,
-            ft_jitter_ms: 0.0,
-            present_hold_p50_ms: 0.0,
-            present_hold_max_ms: 0.0,
-            pacing_wait_p50_ms: 0.0,
-            late_frames: 0,
-        };
-    }
-
-    let mean = ft_list.iter().sum::<f64>() / count as f64;
-    let variance = ft_list.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / count as f64;
-    let std_dev = variance.sqrt();
-
-    let mut sorted_ft = ft_list.clone();
-    sorted_ft.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p50 = percentile(&sorted_ft, 0.50);
-    let p99 = percentile(&sorted_ft, 0.99);
-    let min = sorted_ft.first().copied().unwrap_or(0.0);
-    let max = sorted_ft.last().copied().unwrap_or(0.0);
-    let jitter = (p99 - p50).max(0.0);
-
-    let mut sorted_hold = hold_list.clone();
-    sorted_hold.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let hold_p50 = percentile(&sorted_hold, 0.50);
-    let hold_max = sorted_hold.last().copied().unwrap_or(0.0);
-
-    let mut sorted_wait = wait_list.clone();
-    sorted_wait.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let wait_p50 = percentile(&sorted_wait, 0.50);
-
-    let fps = if mean > 0.0 { 1000.0 / mean } else { 0.0 };
-
-    PhaseResult {
-        name,
-        total_frames: count,
-        fps,
-        ft_mean_ms: mean,
-        ft_p50_ms: p50,
-        ft_p99_ms: p99,
-        ft_min_ms: min,
-        ft_max_ms: max,
-        ft_std_ms: std_dev,
-        ft_jitter_ms: jitter,
-        present_hold_p50_ms: hold_p50,
-        present_hold_max_ms: hold_max,
-        pacing_wait_p50_ms: wait_p50,
-        late_frames: late_count,
-    }
+    compute_phase_metrics(name, &ft_list, &hold_list, &wait_list, late_count)
 }
 
 pub fn run_benchmark() {
