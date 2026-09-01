@@ -79,6 +79,10 @@ pub struct SharedHeader {
     pub vsync_override: AtomicU32,
     /// Per-game opt-in: force FRAME_LATENCY_WAITABLE_OBJECT on new swap chains.
     pub force_waitable: AtomicU32,
+    /// Host heartbeat timestamp in QPC ticks (written by UI/host every ~20ms).
+    pub host_heartbeat_qpc: AtomicU64,
+    /// 1 if an interactive host/UI is attached and maintaining heartbeats, 0 for CLI one-shot.
+    pub host_present: AtomicU32,
     pub _pad: [u8; 0],
 }
 
@@ -272,6 +276,36 @@ impl SharedRing {
     pub fn dropped(&self) -> u64 {
         self.header().dropped.load(Ordering::Relaxed)
     }
+
+    /// App/Host side: update heartbeat timestamp and declare host presence.
+    pub fn update_heartbeat(&self, now_qpc: u64) {
+        let header = self.header();
+        header.host_heartbeat_qpc.store(now_qpc, Ordering::Release);
+        header.host_present.store(1, Ordering::Release);
+    }
+
+    /// Hook/DLL side: check if host is alive. Returns true if host is alive or if running headless.
+    pub fn is_host_alive(&self, now_qpc: u64, timeout_qpc: u64) -> bool {
+        let header = self.header();
+        let present = header.host_present.load(Ordering::Acquire);
+        if present == 0 {
+            return true; // Headless / CLI one-shot mode: no host watchdog required
+        }
+        let last = header.host_heartbeat_qpc.load(Ordering::Acquire);
+        if now_qpc >= last {
+            (now_qpc - last) < timeout_qpc
+        } else {
+            true // Clock skew safeguard
+        }
+    }
+
+    /// Host side: declare that no interactive host is present (CLI one-shot
+    /// commands that publish a config and exit). Clears a stale `host_present`
+    /// left by a previous UI session, otherwise the in-game watchdog would
+    /// see a dead host and silently ignore the freshly published config.
+    pub fn mark_headless(&self) {
+        self.header().host_present.store(0, Ordering::Release);
+    }
 }
 
 #[cfg(test)]
@@ -408,6 +442,29 @@ mod tests {
             };
             ring.set_config(&cfg);
             assert_eq!(ring.config(), cfg);
+        }
+    }
+
+    #[test]
+    fn heartbeat_watchdog_lifecycle() {
+        let cap = 8usize;
+        let buf = AlignedBuf::new(total_size(cap));
+        unsafe {
+            let ring = SharedRing::init(buf.ptr, total_size(cap), cap).unwrap();
+            // Headless by default: the hook must trust the config indefinitely.
+            assert!(ring.is_host_alive(1_000, 100));
+            // A live host bumps the heartbeat.
+            ring.update_heartbeat(1_000);
+            assert!(ring.is_host_alive(1_050, 100));
+            assert!(
+                !ring.is_host_alive(1_200, 100),
+                "stale heartbeat must read as dead"
+            );
+            // Clock skew (now < last) must not read as dead.
+            assert!(ring.is_host_alive(900, 100));
+            // CLI one-shot after a UI session: back to headless.
+            ring.mark_headless();
+            assert!(ring.is_host_alive(9_999, 100));
         }
     }
 

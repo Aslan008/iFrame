@@ -1257,6 +1257,7 @@ dependencies = [
  "ferrisetw",
  "global-hotkey",
  "iframe-common",
+ "iframe-solver",
  "serde",
  "toml 0.9.12+spec-1.1.0",
  "tray-icon",
@@ -1273,6 +1274,14 @@ version = "1.0.0"
 dependencies = [
  "iframe-common",
  "windows 0.61.3",
+]
+
+[[package]]
+name = "iframe-solver"
+version = "1.0.0"
+dependencies = [
+ "cc",
+ "iframe-common",
 ]
 
 [[package]]

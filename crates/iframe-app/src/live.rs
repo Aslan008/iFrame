@@ -34,6 +34,10 @@ pub struct SideStats {
     pub wait_p50_us: f64,
     /// False for ETW telemetry (no present-duration data there).
     pub has_timing: bool,
+    /// Frames in this state that missed their VBlank target.
+    pub late: u64,
+    /// Max real Present duration within the window.
+    pub hold_max_us: f64,
 }
 
 #[derive(Default)]
@@ -105,6 +109,7 @@ struct SideBucket {
     holds: VecDeque<f64>,
     waits: VecDeque<f64>,
     total: u64,
+    late: u64,
 }
 
 /// Median of an unsorted queue.
@@ -130,10 +135,11 @@ impl SideBucket {
             holds: VecDeque::with_capacity(1024),
             waits: VecDeque::with_capacity(1024),
             total: 0,
+            late: 0,
         }
     }
 
-    fn push(&mut self, t: f64, ft_us: f64, hold_us: f64, wait_us: f64) {
+    fn push(&mut self, t: f64, ft_us: f64, hold_us: f64, wait_us: f64, late: bool) {
         // Reset if time went backwards (e.g. clock jump or ring wrap around)
         if let Some(&(last_t, _)) = self.samples.back() {
             if t < last_t {
@@ -147,6 +153,9 @@ impl SideBucket {
         self.holds.push_back(hold_us);
         self.waits.push_back(wait_us);
         self.total += 1;
+        if late {
+            self.late += 1;
+        }
 
         let cutoff = t - HISTORY_SECONDS;
         while let Some(&(front_t, _)) = self.samples.front() {
@@ -173,8 +182,10 @@ impl SideBucket {
             p99_us: p99,
             total: self.total,
             hold_p50_us: p50_of(&self.holds),
+            hold_max_us: self.holds.iter().copied().fold(0.0_f64, f64::max),
             wait_p50_us: p50_of(&self.waits),
             has_timing: true,
+            late: self.late,
         }
     }
 }
@@ -228,6 +239,7 @@ fn worker(pid: u32, state: Arc<SharedState>) {
         if state.attached_pid.load(Ordering::Relaxed) != pid {
             break;
         }
+        ring.update_heartbeat(qpc_now() as u64);
         let n = sm_host::drain(ring, &mut scratch);
         let limiter_on = state.limiter_on.load(Ordering::Relaxed);
         for f in &scratch[..n] {
@@ -248,10 +260,11 @@ fn worker(pid: u32, state: Arc<SharedState>) {
                     }
                     samples.push_back((t_s, ft_us));
 
+                    let is_late = f.flags & TelemetryFrame::FLAG_LATE != 0;
                     if limiter_on {
-                        on_bucket.push(t_s, ft_us, hold_us, wait_us);
+                        on_bucket.push(t_s, ft_us, hold_us, wait_us, is_late);
                     } else {
-                        off_bucket.push(t_s, ft_us, hold_us, wait_us);
+                        off_bucket.push(t_s, ft_us, hold_us, wait_us, is_late);
                     }
                 }
             }
@@ -348,7 +361,7 @@ mod tests {
         let mut b = SideBucket::new();
         // 15 s of samples at 10 Hz → only the last 10 s survive the trim.
         for i in 0..150 {
-            b.push(i as f64 * 0.1, 10_000.0, 120.0, 5.0);
+            b.push(i as f64 * 0.1, 10_000.0, 120.0, 5.0, i == 149);
         }
         assert_eq!(b.samples.len(), 101);
         assert_eq!(b.holds.len(), 101);
@@ -358,6 +371,8 @@ mod tests {
         assert!(published.has_timing);
         assert!((published.fps - 100.0).abs() < 0.01);
         assert!((published.hold_p50_us - 120.0).abs() < 1e-9);
+        assert!((published.hold_max_us - 120.0).abs() < 1e-9);
+        assert_eq!(published.late, 1);
         assert!((published.wait_p50_us - 5.0).abs() < 1e-9);
     }
 }

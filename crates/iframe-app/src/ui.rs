@@ -63,6 +63,19 @@ pub struct IFrameApp {
     display_stats: DisplaySnapshot,
     last_stats_refresh: Instant,
     reset_plot_view: bool,
+    custom_refresh_hz: f64,
+
+    solver_cadence_fps: f64,
+    solver_cadence_hz: f64,
+    solver_cadence_result: Option<iframe_solver::cadence_synthesizer::CadenceSchedule>,
+    solver_config_result: Option<String>,
+    solver_demo_result: Option<String>,
+    solver_has_flip: bool,
+    solver_has_vrr: bool,
+    solver_is_fullscreen: bool,
+
+    tuner_result: Option<iframe_solver::telemetry_tuner::TuningRecommendation>,
+    tuner_error: Option<String>,
 }
 
 impl IFrameApp {
@@ -95,6 +108,17 @@ impl IFrameApp {
             display_stats: DisplaySnapshot::default(),
             last_stats_refresh: Instant::now() - Duration::from_secs(1),
             reset_plot_view: false,
+            custom_refresh_hz: 0.0,
+            solver_cadence_fps: 40.0,
+            solver_cadence_hz: 144.0,
+            solver_cadence_result: None,
+            solver_config_result: None,
+            solver_demo_result: None,
+            solver_has_flip: true,
+            solver_has_vrr: true,
+            solver_is_fullscreen: false,
+            tuner_result: None,
+            tuner_error: None,
         };
         app.refresh_windows();
         app
@@ -194,6 +218,7 @@ impl IFrameApp {
                         self.vsync_override = p.vsync_override;
                         self.force_waitable = p.force_waitable;
                         self.auto_attach = p.auto_attach;
+                        self.custom_refresh_hz = p.refresh_hz;
                     }
                 }
                 self.state.attached_pid.store(pid, Ordering::Relaxed);
@@ -224,6 +249,10 @@ impl IFrameApp {
                 force_waitable: false,
             };
             mapping.ring.set_config(&cfg);
+            // No interactive host anymore: clear host_present so the in-game
+            // watchdog does not see a stale heartbeat, and a later CLI `limit`
+            // can run headless.
+            mapping.ring.mark_headless();
         }
         if let Some(w) = self.worker.take() {
             let _ = w.join();
@@ -241,7 +270,7 @@ impl IFrameApp {
                 enabled,
                 mode: self.mode,
                 target_fps: self.target_fps,
-                refresh_hz: 0.0, // 0 = the DLL trusts the DWM hint
+                refresh_hz: self.custom_refresh_hz, // 0 = the DLL trusts the DWM hint
                 vsync_override: self.vsync_override,
                 force_waitable: self.force_waitable,
             };
@@ -260,6 +289,7 @@ impl IFrameApp {
                         vsync_override: self.vsync_override,
                         auto_attach: self.auto_attach,
                         force_waitable: self.force_waitable,
+                        refresh_hz: self.custom_refresh_hz,
                     },
                 );
             }
@@ -522,7 +552,7 @@ impl eframe::App for IFrameApp {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let d = &self.display_stats;
+                    let d = self.display_stats.clone();
 
                     // --- live headline stats with tooltips ---
                     ui.horizontal(|ui| {
@@ -653,6 +683,124 @@ impl eframe::App for IFrameApp {
                         } else if attached_pid != 0 {
                             ui.weak("💡 Подсказка: нажмите Ctrl+Alt+I на 5 секунд (выключить), затем снова Ctrl+Alt+I (включить), чтобы накопить данные для оценки.");
                         }
+
+                        // --- CDCL Telemetry Auto-Tuner block ---
+                        ui.add_space(6.0);
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("🎯 CDCL Авто-Диагностика & Тюнинг по данным игры").strong());
+                            });
+                            ui.add_space(2.0);
+
+                            // Status of collected samples
+                            let off_ready = off.total >= 80;
+                            let on_ready = on.total >= 80;
+
+                            ui.horizontal(|ui| {
+                                if off_ready {
+                                    ui.colored_label(egui::Color32::from_rgb(0x30, 0xE0, 0x6A), format!("✓ До лимитера: {} кадров", off.total));
+                                } else {
+                                    ui.colored_label(egui::Color32::from_rgb(0xE0, 0xA0, 0x30), format!("◌ До лимитера: {}/80 кадров (нужно ~5 сек)", off.total));
+                                }
+                                ui.separator();
+                                if on_ready {
+                                    ui.colored_label(egui::Color32::from_rgb(0x30, 0xE0, 0x6A), format!("✓ С лимитером: {} кадров", on.total));
+                                } else {
+                                    ui.colored_label(egui::Color32::from_rgb(0xE0, 0xA0, 0x30), format!("◌ С лимитером: {}/80 кадров (нужно ~5 сек)", on.total));
+                                }
+                            });
+                            ui.add_space(3.0);
+
+                            ui.horizontal(|ui| {
+                                if ui.button(egui::RichText::new("🎯 Рассчитать оптимальный профиль (CDCL)").strong())
+                                    .on_hover_text("Запустить SAT-анализ реальной телеметрии, выявить узкие места и рассчитать идеальный FPS")
+                                    .clicked()
+                                {
+                                    let off_metrics = iframe_solver::telemetry_tuner::SideMetrics {
+                                        fps: off.fps,
+                                        p50_ms: off.p50_us / 1000.0,
+                                        p99_ms: off.p99_us / 1000.0,
+                                        jitter_ms: off_jitter,
+                                        hold_p50_ms: off.hold_p50_us / 1000.0,
+                                        hold_max_ms: off.hold_max_us / 1000.0,
+                                        wait_p50_ms: off.wait_p50_us / 1000.0,
+                                        late_count: off.late as usize,
+                                        sample_count: off.total as usize,
+                                    };
+                                    let on_metrics = iframe_solver::telemetry_tuner::SideMetrics {
+                                        fps: on.fps,
+                                        p50_ms: on.p50_us / 1000.0,
+                                        p99_ms: on.p99_us / 1000.0,
+                                        jitter_ms: on_jitter,
+                                        hold_p50_ms: on.hold_p50_us / 1000.0,
+                                        hold_max_ms: on.hold_max_us / 1000.0,
+                                        wait_p50_ms: on.wait_p50_us / 1000.0,
+                                        late_count: on.late as usize,
+                                        sample_count: on.total as usize,
+                                    };
+                                    let input = iframe_solver::telemetry_tuner::GameTelemetryInput {
+                                        off: off_metrics,
+                                        on: on_metrics,
+                                        refresh_hz: if self.custom_refresh_hz > 1.0 { self.custom_refresh_hz } else { 144.0 },
+                                        current_target_fps: self.target_fps,
+                                    };
+                                    match iframe_solver::telemetry_tuner::TelemetryTuner::analyze(&input) {
+                                        Ok(rec) => {
+                                            self.tuner_result = Some(rec);
+                                            self.tuner_error = None;
+                                        }
+                                        Err(e) => {
+                                            self.tuner_error = Some(e);
+                                            self.tuner_result = None;
+                                        }
+                                    }
+                                }
+                            });
+
+                            if let Some(err) = &self.tuner_error {
+                                ui.colored_label(egui::Color32::from_rgb(0xE0, 0x60, 0x60), format!("• {err}"));
+                            }
+
+                            let tuner_rec = self.tuner_result.clone();
+                            if let Some(rec) = &tuner_rec {
+                                ui.add_space(4.0);
+                                ui.group(|ui| {
+                                    ui.label(egui::RichText::new("🩺 Диагноз игрового конвейера:").strong());
+                                    ui.colored_label(egui::Color32::from_rgb(0x50, 0x90, 0xC0), &rec.diagnosis_summary);
+                                    ui.add_space(3.0);
+
+                                    ui.label(egui::RichText::new("📊 Математический расчёт эффекта:").strong());
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("⚡ Снижение задержки ввода: ~{:.1} мс", rec.expected_latency_reduction_ms));
+                                        ui.separator();
+                                        ui.label(format!("📈 Устранение статтеров: в {:.1}x раз", rec.expected_jitter_improvement_times));
+                                        ui.separator();
+                                        ui.label(format!("❄ Разгрузка GPU / охлаждение: на {:.0}%", rec.expected_gpu_load_relief_percent));
+                                    });
+                                    ui.add_space(3.0);
+
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(0x30, 0xE0, 0x6A),
+                                        format!(
+                                            "💡 Рекомендация CDCL: {:.0} FPS (Режим: {:?}, Шаги каденции: {:?})",
+                                            rec.recommended_fps, rec.recommended_mode, rec.cadence_steps
+                                        ),
+                                    );
+                                    ui.add_space(3.0);
+
+                                    let mut apply_tune_profile: Option<(f64, PacerMode, bool)> = None;
+                                    if ui.button(egui::RichText::new("✔ Применить рекомендацию CDCL в 1 клик").strong()).clicked() {
+                                        apply_tune_profile = Some((rec.recommended_fps, rec.recommended_mode, rec.recommended_vsync_override));
+                                    }
+                                    if let Some((fps, mode, vsync)) = apply_tune_profile {
+                                        self.target_fps = fps;
+                                        self.mode = mode;
+                                        self.vsync_override = vsync;
+                                        self.push_config();
+                                    }
+                                });
+                            }
+                        });
                     });
                     ui.add_space(6.0);
 
@@ -703,6 +851,29 @@ impl eframe::App for IFrameApp {
                                 .on_hover_text("Ограничение отключено (режим замера без пейсинга)")
                                 .changed();
                             if changed {
+                                self.push_config();
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Герцовка экрана:");
+                            let refresh_text = if self.custom_refresh_hz <= 1.0 {
+                                "Авто (DWM)".to_string()
+                            } else {
+                                format!("{:.0} Гц", self.custom_refresh_hz)
+                            };
+                            let mut refresh_changed = false;
+                            egui::ComboBox::from_id_salt("refresh_override")
+                                .selected_text(refresh_text)
+                                .show_ui(ui, |ui| {
+                                    refresh_changed |= ui.selectable_value(&mut self.custom_refresh_hz, 0.0, "Авто (DWM)").changed();
+                                    refresh_changed |= ui.selectable_value(&mut self.custom_refresh_hz, 60.0, "60 Гц").changed();
+                                    refresh_changed |= ui.selectable_value(&mut self.custom_refresh_hz, 120.0, "120 Гц").changed();
+                                    refresh_changed |= ui.selectable_value(&mut self.custom_refresh_hz, 144.0, "144 Гц").changed();
+                                    refresh_changed |= ui.selectable_value(&mut self.custom_refresh_hz, 165.0, "165 Гц").changed();
+                                    refresh_changed |= ui.selectable_value(&mut self.custom_refresh_hz, 240.0, "240 Гц").changed();
+                                });
+                            if refresh_changed {
                                 self.push_config();
                             }
                         });
@@ -774,6 +945,153 @@ impl eframe::App for IFrameApp {
                             }
                         });
                     });
+                    ui.add_space(6.0);
+
+                    // --- CDCL Solver & Optimization panel ---
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("🧠 C++ CDCL Решатель & Оптимизация").strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("🧪 Тест ядра").on_hover_text("Запустить решение контрольной SAT/UNSAT формулы").clicked() {
+                                    let t0 = Instant::now();
+                                    let mut s = iframe_solver::CdclSolver::new(10);
+                                    s.add_clause(&[1, 2, 3]);
+                                    s.add_clause(&[-1, 2]);
+                                    s.add_clause(&[-2, 3]);
+                                    s.add_clause(&[-3]);
+                                    s.add_clause(&[1]);
+                                    let res = s.solve(1000);
+                                    let elapsed = t0.elapsed();
+                                    let stats = s.stats();
+                                    self.solver_demo_result = Some(format!(
+                                        "{res:?} за {:.1} µs (пропагаций: {}, конфликтов: {})",
+                                        elapsed.as_micros(),
+                                        stats.propagations,
+                                        stats.conflicts
+                                    ));
+                                }
+                            });
+                        });
+                        ui.add_space(2.0);
+
+                        if let Some(demo) = &self.solver_demo_result {
+                            ui.colored_label(egui::Color32::from_rgb(0x50, 0x90, 0xC0), format!("• Результат теста: {demo}"));
+                            ui.add_space(2.0);
+                        }
+
+                        // 1. Cadence Synthesizer
+                        ui.label(egui::RichText::new("1. Синтез идеального ритма VBlank (Cadence)").small().weak());
+                        ui.horizontal(|ui| {
+                            ui.label("Цель FPS:");
+                            ui.add(egui::DragValue::new(&mut self.solver_cadence_fps).speed(0.5).range(10.0..=360.0));
+                            ui.label("Герцовка экрана:");
+                            ui.add(egui::DragValue::new(&mut self.solver_cadence_hz).speed(1.0).range(30.0..=480.0));
+
+                            if ui.button("⚡ Рассчитать (CDCL)").clicked() {
+                                match iframe_solver::cadence_synthesizer::CadenceSynthesizer::synthesize(
+                                    self.solver_cadence_fps,
+                                    self.solver_cadence_hz,
+                                ) {
+                                    Ok(sched) => {
+                                        self.solver_cadence_result = Some(sched);
+                                    }
+                                    Err(e) => {
+                                        self.solver_cadence_result = None;
+                                        log_ui(&format!("Cadence solver error: {e}"));
+                                    }
+                                }
+                            }
+                        });
+
+                        let mut apply_cadence = false;
+                        if let Some(sched) = &self.solver_cadence_result {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(0x30, 0xE0, 0x6A),
+                                    format!(
+                                        "✔ Период: {} кадров ({} VBlanks, среднее: {:.2}). Шаги: {:?}",
+                                        sched.period_frames,
+                                        sched.total_vblanks,
+                                        sched.avg_vblanks_per_frame,
+                                        sched.steps
+                                    ),
+                                );
+                                if ui.button("Применить в лимитер").clicked() {
+                                    apply_cadence = true;
+                                }
+                            });
+                        }
+                        if apply_cadence {
+                            self.target_fps = self.solver_cadence_fps;
+                            self.mode = PacerMode::FixedVsync;
+                            self.push_config();
+                        }
+                        ui.add_space(4.0);
+
+                        // 2. Config Optimizer
+                        ui.label(egui::RichText::new("2. SAT-Оптимизатор параметров SwapChain & VRR").small().weak());
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.solver_has_flip, "Flip Model");
+                            ui.checkbox(&mut self.solver_has_vrr, "VRR экран");
+                            ui.checkbox(&mut self.solver_is_fullscreen, "Эксклюзивный экран");
+
+                            if ui.button("🔍 Синтез конфигурации").clicked() {
+                                let caps = iframe_solver::config_optimizer::SystemCapabilities {
+                                    has_flip_model: self.solver_has_flip,
+                                    monitor_vrr_capable: self.solver_has_vrr,
+                                    monitor_refresh_hz: self.solver_cadence_hz,
+                                    is_exclusive_fullscreen: self.solver_is_fullscreen,
+                                };
+                                let prefs = iframe_solver::config_optimizer::UserPreferences {
+                                    target_fps: self.target_fps,
+                                    prefer_vrr: self.solver_has_vrr,
+                                    prefer_lowest_latency: true,
+                                    allow_vsync_override: true,
+                                };
+                                match iframe_solver::config_optimizer::ConfigOptimizer::optimize(&caps, &prefs) {
+                                    Ok(cfg) => {
+                                        self.mode = cfg.mode;
+                                        self.vsync_override = cfg.vsync_override;
+                                        self.force_waitable = cfg.force_waitable;
+                                        self.push_config();
+                                        self.solver_config_result = Some(format!(
+                                            "Режим: {:?}, VSync Override: {}, Waitable: {}",
+                                            cfg.mode, cfg.vsync_override, cfg.force_waitable
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        self.solver_config_result = Some(format!("Ошибка: {e}"));
+                                    }
+                                }
+                            }
+                        });
+
+                        if let Some(cfg_msg) = &self.solver_config_result {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0x30, 0xE0, 0x6A),
+                                format!("✔ Конфигурация доказана и применена: {cfg_msg}"),
+                            );
+                        }
+                    });
+                    ui.add_space(4.0);
+
+                    // 4. Event Log / Journal
+                    ui.collapsing("📋 Журнал событий", |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(120.0)
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                if let Ok(logs) = UI_LOGS.lock() {
+                                    if logs.is_empty() {
+                                        ui.weak("Журнал пуст.");
+                                    } else {
+                                        for entry in logs.iter() {
+                                            ui.label(egui::RichText::new(entry).monospace().small());
+                                        }
+                                    }
+                                }
+                            });
+                    });
                 });
         });
     }
@@ -795,6 +1113,7 @@ impl Drop for IFrameApp {
                 force_waitable: false,
             };
             mapping.ring.set_config(&cfg);
+            mapping.ring.mark_headless();
         }
     }
 }
@@ -906,8 +1225,20 @@ fn process_exe_name(pid: u32) -> Option<String> {
     }
 }
 
+static UI_LOGS: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
 fn log_ui(msg: &str) {
     eprintln!("[iFrame] {msg}");
+    if let Ok(mut logs) = UI_LOGS.lock() {
+        if logs.len() >= 50 {
+            logs.pop_front();
+        }
+        let now_s = live_now_s();
+        let min = (now_s / 60.0) as u32 % 60;
+        let sec = now_s as u32 % 60;
+        logs.push_back(format!("[{min:02}:{sec:02}] {msg}"));
+    }
 }
 
 /// Entry point for the GUI mode.

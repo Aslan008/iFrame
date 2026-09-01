@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/iframe-common",
+    "crates/iframe-solver",
     "crates/iframe-hook",
     "crates/iframe-app",
     "tests/d3d11-test-app",

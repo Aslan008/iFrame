@@ -18,7 +18,7 @@
 //!   for exclusive fullscreen.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, HWND, TRUE};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
@@ -27,7 +27,7 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11DeviceContext,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGISwapChain, IDXGISwapChain1, DXGI_PRESENT_ALLOW_TEARING,
+    IDXGIDevice, IDXGISwapChain, IDXGISwapChain1, IDXGISwapChain2, DXGI_PRESENT_ALLOW_TEARING,
     DXGI_SWAP_CHAIN_DESC, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
     DXGI_USAGE_RENDER_TARGET_OUTPUT, DXGI_PRESENT_PARAMETERS,
@@ -51,27 +51,32 @@ use crate::telemetry;
 
 // IDXGISwapChain: IUnknown(0..2) + IDXGIObject(3..6) + IDXGIDeviceSubObject(7)
 //   + Present(8) GetBuffer(9) SetFullscreenState(10) GetFullscreenState(11)
-//   GetDesc(12) ResizeBuffers(13) GetContainingOutput(14) GetFrameStatistics(15)
-//   GetLastPresentCount(16)
-// IDXGISwapChain1 continues: GetDesc1(17) GetFullscreenDesc(18) GetHwnd(19)
-//   GetCoreWindow(20) Present1(21) ...
+//   GetDesc(12) ResizeBuffers(13) ResizeTarget(14) GetContainingOutput(15)
+//   GetFrameStatistics(16) GetLastPresentCount(17)
+// IDXGISwapChain1 continues: GetDesc1(18) GetFullscreenDesc(19) GetHwnd(20)
+//   GetCoreWindow(21) Present1(22) IsTemporaryMonoSupported(23) ...
+// (verified against the windows-crate `IDXGISwapChain2_Vtbl` field order AND
+//  at runtime by `vtable_slot_indices_match_real_com_objects` below — the old
+//  count dropped ResizeTarget and silently hooked GetCoreWindow as Present1)
 const SLOT_PRESENT: usize = 8;
 const SLOT_RESIZE_BUFFERS: usize = 13;
-const SLOT_PRESENT1: usize = 21;
+const SLOT_PRESENT1: usize = 22;
 
-// IDXGIFactory2: IUnknown(0..2) + IDXGIObject(3..6)
-//   + EnumAdapters(7) MakeWindowAssociation(8) GetWindowAssociation(9)
-//   CreateSwapChain(10) | EnumAdapters1(11) IsCurrent(12)
-//   | IsWindowedStereoEnabled(13) CreateSwapChainForHwnd(14)
-//   CreateSwapChainForCoreWindow(15) GetSharedResourceAdapterLuid(16)
-//   RegisterStereoStatusWindow(17) RegisterStereoStatusEvent(18)
-//   UnregisterStereoStatus(19) RegisterOcclusionStatusWindow(20)
-//   RegisterOcclusionStatusEvent(21) UnregisterOcclusionStatus(22)
-//   CreateSwapChainForComposition(23)
+// IDXGIFactory: IUnknown(0..2) + IDXGIObject(3..6) + EnumAdapters(7)
+//   MakeWindowAssociation(8) GetWindowAssociation(9) CreateSwapChain(10)
+//   CreateSoftwareAdapter(11)
+// IDXGIFactory1: EnumAdapters1(12) IsCurrent(13)   <- IsCurrent was dropped in
+//   the old count, shifting every IDXGIFactory2 slot down by one
+// IDXGIFactory2: IsWindowedStereoEnabled(14) CreateSwapChainForHwnd(15)
+//   CreateSwapChainForCoreWindow(16) GetSharedResourceAdapterLuid(17)
+//   RegisterStereoStatusWindow(18) RegisterStereoStatusEvent(19)
+//   UnregisterStereoStatus(20) RegisterOcclusionStatusWindow(21)
+//   RegisterOcclusionStatusEvent(22) UnregisterOcclusionStatus(23)
+//   CreateSwapChainForComposition(24)
 const SLOT_FACTORY_CREATE: usize = 10;
-const SLOT_FACTORY_FOR_HWND: usize = 14;
-const SLOT_FACTORY_FOR_CORE_WINDOW: usize = 15;
-const SLOT_FACTORY_FOR_COMPOSITION: usize = 23;
+const SLOT_FACTORY_FOR_HWND: usize = 15;
+const SLOT_FACTORY_FOR_CORE_WINDOW: usize = 16;
+const SLOT_FACTORY_FOR_COMPOSITION: usize = 24;
 
 type PresentFn = unsafe extern "system" fn(this: *mut c_void, sync_interval: u32, flags: u32) -> i32;
 type Present1Fn = unsafe extern "system" fn(
@@ -209,7 +214,7 @@ pub unsafe fn install() -> Result<(), String> {
     drop(device);
     let _ = DestroyWindow(hwnd);
     crate::log_line(
-        "dxgi hooks installed (Present@8, ResizeBuffers@13, Present1@21, factory create@10/14/15/23)",
+        "dxgi hooks installed (Present@8, ResizeBuffers@13, Present1@22, factory create@10/15/16/24)",
     );
     Ok(())
 }
@@ -252,6 +257,43 @@ fn restore_slot(
 // Hook bodies (hot path — lock-free, allocation-free, panic-free)
 // ---------------------------------------------------------------------------
 
+/// One-time `IDXGISwapChain2::SetMaximumFrameLatency(1)` on the active swap
+/// chain: caps DXGI's pre-rendered frame queue at 1 so the JIT-paced schedule
+/// actually reaches the display on time. Called ONLY while pacing is active —
+/// with the limiter off iFrame is a pure pass-through and must not alter the
+/// game's queue depth.
+///
+/// Uses the typed `IDXGISwapChain2` wrapper (correct IID + correct vtable slot
+/// straight from the windows crate) instead of a hand-typed GUID: the previous
+/// version carried a wrong IID, so its QueryInterface silently failed and the
+/// call never happened. One attempt per distinct swap chain pointer — swap
+/// chains get recreated, and unsupported (pre-DXGI-1.3) objects must not be
+/// re-QI'd on every present.
+fn ensure_maximum_frame_latency(this: *mut c_void) {
+    static LAST_SC: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static STATE: AtomicU32 = AtomicU32::new(0); // 0 = untried, 1 = applied, 2 = unsupported
+    if LAST_SC.load(Ordering::Relaxed) == this && STATE.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    LAST_SC.store(this, Ordering::Relaxed);
+    // Borrow the COM object without owning it: ManuallyDrop skips the Release
+    // (we hold no reference of our own). `cast` runs a real QueryInterface
+    // with the crate's own IID; the returned wrapper Releases on drop.
+    let sc = std::mem::ManuallyDrop::new(unsafe {
+        std::mem::transmute::<*mut c_void, IDXGISwapChain>(this)
+    });
+    match sc.cast::<IDXGISwapChain2>() {
+        Ok(sc2) => {
+            unsafe {
+                let _ = sc2.SetMaximumFrameLatency(1);
+            }
+            STATE.store(1, Ordering::Relaxed);
+            crate::log_line("SetMaximumFrameLatency(1) applied via IDXGISwapChain2");
+        }
+        Err(_) => STATE.store(2, Ordering::Relaxed),
+    }
+}
+
 /// JIT-paced Present: the real Present executes IMMEDIATELY (the frame is
 /// never held); the sleep happens after it, delaying only the START of the
 /// next frame so it completes just-in-time for its target vblank.
@@ -260,6 +302,9 @@ unsafe extern "system" fn hooked_present(this: *mut c_void, sync_interval: u32, 
     let cfg = telemetry::config();
     let active = is_active_swapchain(this);
     let pacing = active && cfg.enabled && cfg.mode != PacerMode::Bypass;
+    if pacing {
+        ensure_maximum_frame_latency(this);
+    }
     // К1: while pacing, OUR timer owns the timing — the game's VSync wait
     // inside Present would double-wait. Tearing-capable swap chains get
     // SyncInterval=0 + ALLOW_TEARING (exact delivery); windowed flip gets
@@ -300,6 +345,9 @@ unsafe extern "system" fn hooked_present1(
     let cfg = telemetry::config();
     let active = is_active_swapchain(this);
     let pacing = active && cfg.enabled && cfg.mode != PacerMode::Bypass;
+    if pacing {
+        ensure_maximum_frame_latency(this);
+    }
     let (sync, present_flags) = if pacing {
         unsafe { override_sync(sync_interval, flags, cfg.vsync_override) }
     } else {
@@ -784,5 +832,88 @@ unsafe fn create_dummy_device_and_swapchain(
     let swapchain = swapchain.ok_or_else(|| "no swap chain returned".to_string())?;
     let device = device.ok_or_else(|| "no device returned".to_string())?;
     Ok((device, swapchain))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hand-counted slot constants above MUST match the real COM ABI.
+    /// Derives the truth from live COM objects: the pointer stored in the
+    /// object's vtable at `base + index * 8` must equal the typed vtable field
+    /// generated by the windows crate from the SDK metadata. This test exists
+    /// because Present1 was silently patched at GetCoreWindow's slot (21
+    /// instead of 22) and the factory family was off by one.
+    #[test]
+    fn vtable_slot_indices_match_real_com_objects() {
+        let hwnd = create_hidden_window().expect("dummy window");
+        let (device, swapchain) =
+            create_dummy_device_and_swapchain(hwnd).expect("dummy swapchain");
+
+        let raw = *(swapchain.as_raw() as *mut *mut *mut c_void);
+        let sc2: IDXGISwapChain2 = swapchain.cast().expect("SwapChain2");
+        let vt = unsafe { windows::core::Interface::vtable(&sc2) };
+        let slot = |i: usize| unsafe { core::ptr::read(raw.add(i)) } as usize;
+
+        assert_eq!(
+            slot(SLOT_PRESENT),
+            vt.base__.base__.Present as usize,
+            "SLOT_PRESENT must be the real Present"
+        );
+        assert_eq!(
+            slot(SLOT_RESIZE_BUFFERS),
+            vt.base__.base__.ResizeBuffers as usize,
+            "SLOT_RESIZE_BUFFERS must be the real ResizeBuffers"
+        );
+        assert_eq!(
+            slot(SLOT_PRESENT1),
+            vt.base__.Present1 as usize,
+            "SLOT_PRESENT1 must be the real Present1 (22, not GetCoreWindow@21)"
+        );
+        assert_eq!(
+            slot(21),
+            vt.base__.GetCoreWindow as usize,
+            "slot 21 is GetCoreWindow — regression guard for the old off-by-one"
+        );
+
+        let dxgi_device: IDXGIDevice = device.cast().expect("IDXGIDevice");
+        let adapter = unsafe { dxgi_device.GetAdapter() }.expect("adapter");
+        let factory: windows::Win32::Graphics::Dxgi::IDXGIFactory2 =
+            unsafe { adapter.GetParent() }.expect("factory");
+        let fraw = *(factory.as_raw() as *mut *mut *mut c_void);
+        let fvt = unsafe { windows::core::Interface::vtable(&factory) };
+        let fslot = |i: usize| unsafe { core::ptr::read(fraw.add(i)) } as usize;
+
+        assert_eq!(
+            fslot(SLOT_FACTORY_CREATE),
+            fvt.base__.base__.CreateSwapChain as usize,
+            "SLOT_FACTORY_CREATE must be the real CreateSwapChain"
+        );
+        assert_eq!(
+            fslot(SLOT_FACTORY_FOR_HWND),
+            fvt.CreateSwapChainForHwnd as usize,
+            "SLOT_FACTORY_FOR_HWND must be the real CreateSwapChainForHwnd"
+        );
+        assert_eq!(
+            fslot(SLOT_FACTORY_FOR_CORE_WINDOW),
+            fvt.CreateSwapChainForCoreWindow as usize,
+            "SLOT_FACTORY_FOR_CORE_WINDOW must be the real CreateSwapChainForCoreWindow"
+        );
+        assert_eq!(
+            fslot(SLOT_FACTORY_FOR_COMPOSITION),
+            fvt.CreateSwapChainForComposition as usize,
+            "SLOT_FACTORY_FOR_COMPOSITION must be the real CreateSwapChainForComposition"
+        );
+
+        drop(sc2);
+        drop(factory);
+        drop(adapter);
+        drop(dxgi_device);
+        drop(swapchain);
+        drop(device);
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
 }
 

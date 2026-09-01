@@ -141,6 +141,9 @@ pub fn default_dll_path_for(pid: u32) -> std::path::PathBuf {
 
 /// Resolve the PID of a top-level window by exact title.
 pub fn pid_from_window_title(title: &str) -> Result<u32, String> {
+    if title.trim().is_empty() || title.contains('\0') {
+        return Err("window title cannot be empty or contain null bytes".into());
+    }
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId};
     let wide: Vec<u16> = format!("{title}\0").encode_utf16().collect();
     unsafe {

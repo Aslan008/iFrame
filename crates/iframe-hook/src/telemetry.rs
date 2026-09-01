@@ -104,9 +104,19 @@ pub fn init() -> bool {
 }
 
 /// Current runtime config as published by the control app (few atomic loads).
+/// Includes watchdog: if interactive host crashed or was killed (>3s), automatically bypasses.
 #[inline]
 pub fn config() -> RuntimeConfig {
-    ring().map(|r| r.config()).unwrap_or_default()
+    if let Some(r) = ring() {
+        let now_qpc = crate::timing::qpc_now() as u64;
+        let timeout_qpc = (3 * crate::timing::qpc_frequency()) as u64;
+        if !r.is_host_alive(now_qpc, timeout_qpc) {
+            return RuntimeConfig::default();
+        }
+        r.config()
+    } else {
+        RuntimeConfig::default()
+    }
 }
 
 /// Push one pass-through Present record (limiter inert).

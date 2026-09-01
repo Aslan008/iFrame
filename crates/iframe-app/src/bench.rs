@@ -105,7 +105,7 @@ pub fn compute_phase_metrics(
     }
 }
 
-fn collect_phase(
+pub fn collect_phase(
     ring: &iframe_common::shared_mem::SharedRing,
     name: &'static str,
     duration_secs: u64,
@@ -210,6 +210,10 @@ pub fn run_benchmark() {
         let _ = child.kill();
         return;
     }
+    // CLI one-shot: no heartbeat host — the in-game watchdog must trust the
+    // configs published below (a stale host_present from a UI session would
+    // otherwise disable them after 3 s).
+    mapping.ring.mark_headless();
 
     println!("--------------------------------------------------------------------------------");
     println!("Phase 1: Uncapped Baseline (Limiter OFF / Bypass)");
@@ -316,13 +320,18 @@ pub fn run_benchmark() {
 
     println!("\n3. EMPIRICAL VERDICTS:");
     println!("  ✔ [Frametime Pacing]: 60 FPS target p50 = {:.2} ms (ideal 16.67 ms).", r_60.ft_p50_ms);
-    println!("  ✔ [Jitter Reduction]: {:.1}x improvement (±{:.2} ms → ±{:.2} ms).",
-        jitter_improv, r_off.ft_jitter_ms, r_60.ft_jitter_ms);
+    if r_60.ft_jitter_ms <= r_off.ft_jitter_ms && r_off.ft_jitter_ms > 0.05 {
+        println!("  ✔ [Jitter Reduction]: {:.1}x improvement (±{:.2} ms → ±{:.2} ms).",
+            jitter_improv, r_off.ft_jitter_ms, r_60.ft_jitter_ms);
+    } else {
+        println!("  ℹ [Jitter Profile]: Uncapped ±{:.2} ms, Paced ±{:.2} ms.",
+            r_off.ft_jitter_ms, r_60.ft_jitter_ms);
+    }
     println!("  ✔ [Zero Added Input Lag]: Present hold = {:.3} ms (frame NOT held during limiter sleep).", r_60.present_hold_p50_ms);
-    println!("  ★ [NEGATIVE LATENCY]: iFrame pipeline latency is {:.1} ms LESS than uncapped gameplay!", saved_60);
-    println!("     -> Uncapped games accumulate a 3-frame GPU queue ({} ms lag).", format!("{:.1}", off_pipeline_ms));
-    println!("     -> iFrame eliminates the queue via VSync Override + JIT Post-Present Sleep ({} ms lag).", format!("{:.1}", z60_pipeline_ms));
-    println!("     -> Result: faster input response WITH a limiter than WITHOUT one!");
+    println!("  ★ [Pipeline Queue Reduction (модель очереди DXGI)]: iFrame сокращает задержку на ~{:.1} ms vs uncapped!", saved_60);
+    println!("     -> Uncapped игры накапливают 3 кадра очереди GPU (~{} ms задержки).", format!("{:.1}", off_pipeline_ms));
+    println!("     -> iFrame сжимает очередь через VSync Override / SetMaximumFrameLatency(1) + JIT Sleep (~{} ms).", format!("{:.1}", z60_pipeline_ms));
+    println!("     -> Результат: мгновенная подача ввода без застревания в очереди рендера.");
     println!("================================================================================\n");
 }
 

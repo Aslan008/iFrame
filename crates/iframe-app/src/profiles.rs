@@ -18,6 +18,9 @@ pub struct GameProfile {
     /// (per-game opt-in, applied by the hook at swap chain creation).
     #[serde(default)]
     pub force_waitable: bool,
+    /// Manual monitor refresh override in Hz (0 = trust the DWM hint).
+    #[serde(default)]
+    pub refresh_hz: f64,
 }
 
 impl Default for GameProfile {
@@ -28,6 +31,7 @@ impl Default for GameProfile {
             vsync_override: true,
             auto_attach: false,
             force_waitable: false,
+            refresh_hz: 0.0,
         }
     }
 }
