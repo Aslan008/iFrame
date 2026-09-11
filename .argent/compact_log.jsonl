@@ -1,7 +1,0 @@
-{"type": "compact_boundary", "compression_id": 1, "timestamp": "2026-08-29T04:30:28.308758", "messages_before": 344, "messages_after": 334, "messages_dropped": 10}
-{"type": "compact_boundary", "compression_id": 2, "timestamp": "2026-08-29T04:50:22.087606", "messages_before": 406, "messages_after": 338, "messages_dropped": 68}
-{"type": "compact_boundary", "compression_id": 3, "timestamp": "2026-08-29T05:51:29.506677", "messages_before": 466, "messages_after": 103, "messages_dropped": 363}
-{"type": "compact_boundary", "compression_id": 4, "timestamp": "2026-08-29T07:19:50.372986", "messages_before": 429, "messages_after": 421, "messages_dropped": 8}
-{"type": "compact_boundary", "compression_id": 5, "timestamp": "2026-08-29T07:53:06.717776", "messages_before": 527, "messages_after": 439, "messages_dropped": 88}
-{"type": "compact_boundary", "compression_id": 6, "timestamp": "2026-08-29T08:27:39.671761", "messages_before": 457, "messages_after": 132, "messages_dropped": 325}
-{"type": "compact_boundary", "compression_id": 1, "timestamp": "2026-09-02T03:05:49.233622", "messages_before": 161, "messages_after": 51, "messages_dropped": 110}
