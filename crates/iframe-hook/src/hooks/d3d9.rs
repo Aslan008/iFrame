@@ -120,10 +120,28 @@ pub unsafe fn install() -> Result<(), String> {
         return Err("no matching vtable template could be patched".into());
     }
 
-    ORIG_PRESENT.store(real_orig, Ordering::Release);
+    // 4. Install an inline detour on real_orig to intercept pre-existing devices.
+    // Newly created devices hit hooked_present via the template; pre-existing
+    // devices (whose heap vtables point to real_orig) hit the inline detour.
+    // hooked_present calls the returned trampoline to execute the real Present.
+    let orig_exec = match crate::hooks::detour::make_detour(
+        real_orig,
+        hooked_present as *mut c_void,
+    ) {
+        Ok(tramp) => {
+            crate::log_line("d3d9: inline detour installed on IDirect3DDevice9::Present (pre-existing device coverage active)");
+            tramp
+        }
+        Err(e) => {
+            crate::log_line(&format!("d3d9: inline detour on Present failed ({e}), falling back to template-only"));
+            real_orig
+        }
+    };
+
+    ORIG_PRESENT.store(orig_exec, Ordering::Release);
     VTABLE.store(templates[0], Ordering::Release);
     crate::log_line(&format!(
-        "d3d9 hooks installed ({} of {} template(s) verified & patched)",
+        "d3d9 hooks installed ({} of {} template(s) verified & patched; DXVK/D3D9On12 recommended for native Flip Model)",
         patched.len(),
         templates.len()
     ));

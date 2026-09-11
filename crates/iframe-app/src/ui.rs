@@ -20,15 +20,44 @@ enum AttachOutcome {
     Failed(String),
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Copy)]
+pub struct SideSummary {
+    pub fps: f64,
+    pub p50_us: f64,
+    pub p99_us: f64,
+    pub total: u64,
+    pub hold_p50_us: f64,
+    pub wait_p50_us: f64,
+    pub has_timing: bool,
+    pub late: u64,
+    pub hold_max_us: f64,
+}
+
+impl From<&live::SideStats> for SideSummary {
+    fn from(s: &live::SideStats) -> Self {
+        Self {
+            fps: s.fps,
+            p50_us: s.p50_us,
+            p99_us: s.p99_us,
+            total: s.total,
+            hold_p50_us: s.hold_p50_us,
+            wait_p50_us: s.wait_p50_us,
+            has_timing: s.has_timing,
+            late: s.late,
+            hold_max_us: s.hold_max_us,
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy)]
 struct DisplaySnapshot {
     headline_fps: f64,
     headline_p50_us: f64,
     headline_p99_us: f64,
     headline_late: u64,
     headline_total: u64,
-    off: live::SideStats,
-    on: live::SideStats,
+    off: SideSummary,
+    on: SideSummary,
 }
 
 pub struct IFrameApp {
@@ -482,8 +511,8 @@ impl eframe::App for IFrameApp {
                     headline_p99_us: stats.p99_us,
                     headline_late: stats.late,
                     headline_total: stats.total,
-                    off: stats.off.clone(),
-                    on: stats.on.clone(),
+                    off: SideSummary::from(&stats.off),
+                    on: SideSummary::from(&stats.on),
                 };
                 self.last_stats_refresh = Instant::now();
             }
@@ -552,7 +581,7 @@ impl eframe::App for IFrameApp {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let d = self.display_stats.clone();
+                    let d = self.display_stats;
 
                     // --- live headline stats with tooltips ---
                     ui.horizontal(|ui| {
@@ -865,6 +894,7 @@ impl eframe::App for IFrameApp {
                             let mut refresh_changed = false;
                             egui::ComboBox::from_id_salt("refresh_override")
                                 .selected_text(refresh_text)
+                                .width(110.0)
                                 .show_ui(ui, |ui| {
                                     refresh_changed |= ui.selectable_value(&mut self.custom_refresh_hz, 0.0, "Авто (DWM)").changed();
                                     refresh_changed |= ui.selectable_value(&mut self.custom_refresh_hz, 60.0, "60 Гц").changed();
@@ -872,7 +902,18 @@ impl eframe::App for IFrameApp {
                                     refresh_changed |= ui.selectable_value(&mut self.custom_refresh_hz, 144.0, "144 Гц").changed();
                                     refresh_changed |= ui.selectable_value(&mut self.custom_refresh_hz, 165.0, "165 Гц").changed();
                                     refresh_changed |= ui.selectable_value(&mut self.custom_refresh_hz, 240.0, "240 Гц").changed();
+                                    refresh_changed |= ui.selectable_value(&mut self.custom_refresh_hz, 360.0, "360 Гц").changed();
                                 });
+                            ui.label("или:");
+                            refresh_changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut self.custom_refresh_hz)
+                                        .speed(1.0)
+                                        .range(0.0..=1000.0)
+                                        .suffix(" Гц"),
+                                )
+                                .on_hover_text("Произвольная частота обновления монитора (0 = авто из DWM)")
+                                .changed();
                             if refresh_changed {
                                 self.push_config();
                             }
@@ -1228,16 +1269,39 @@ fn process_exe_name(pid: u32) -> Option<String> {
 static UI_LOGS: std::sync::Mutex<std::collections::VecDeque<String>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
+#[repr(C)]
+struct SYSTEMTIME {
+    w_year: u16,
+    w_month: u16,
+    w_day_of_week: u16,
+    w_day: u16,
+    w_hour: u16,
+    w_minute: u16,
+    w_second: u16,
+    w_milliseconds: u16,
+}
+
+unsafe extern "system" {
+    fn GetLocalTime(lp_system_time: *mut SYSTEMTIME);
+}
+
+fn local_time_str() -> String {
+    let mut st = std::mem::MaybeUninit::<SYSTEMTIME>::zeroed();
+    unsafe {
+        GetLocalTime(st.as_mut_ptr());
+        let s = st.assume_init();
+        format!("{:02}:{:02}:{:02}", s.w_hour, s.w_minute, s.w_second)
+    }
+}
+
 fn log_ui(msg: &str) {
     eprintln!("[iFrame] {msg}");
     if let Ok(mut logs) = UI_LOGS.lock() {
         if logs.len() >= 50 {
             logs.pop_front();
         }
-        let now_s = live_now_s();
-        let min = (now_s / 60.0) as u32 % 60;
-        let sec = now_s as u32 % 60;
-        logs.push_back(format!("[{min:02}:{sec:02}] {msg}"));
+        let time_str = local_time_str();
+        logs.push_back(format!("[{time_str}] {msg}"));
     }
 }
 

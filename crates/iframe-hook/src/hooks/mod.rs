@@ -1,4 +1,5 @@
 pub mod d3d9;
+pub mod detour;
 pub mod dxgi;
 pub mod opengl;
 pub mod vulkan;

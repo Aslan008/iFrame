@@ -1,0 +1,12 @@
+[package]
+name = "aif-presenter"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aif-common = { path = "../aif-common" }
+aif-capture = { path = "../aif-capture" }
+aif-flow = { path = "../aif-flow" }
+windows = { workspace = true }

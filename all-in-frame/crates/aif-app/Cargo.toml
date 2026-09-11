@@ -1,0 +1,16 @@
+[package]
+name = "aif-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "all-in-frame"
+path = "src/main.rs"
+
+[dependencies]
+aif-common = { path = "../aif-common" }
+aif-presenter = { path = "../aif-presenter" }
+eframe = { workspace = true }
+egui_plot = { workspace = true }
+windows = { workspace = true }

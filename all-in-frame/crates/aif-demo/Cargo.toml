@@ -1,0 +1,12 @@
+[package]
+name = "aif-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aif-demo"
+path = "src/main.rs"
+
+[dependencies]
+windows = { workspace = true }

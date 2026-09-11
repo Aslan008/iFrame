@@ -1,0 +1,10 @@
+[package]
+name = "aif-capture"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+aif-common = { path = "../aif-common" }
+windows = { workspace = true }

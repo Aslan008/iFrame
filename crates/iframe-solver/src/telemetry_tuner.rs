@@ -77,18 +77,44 @@ impl TelemetryTuner {
             input.on.fps
         };
 
-        // SAT Variable IDs for Diagnosis
+        // SAT Variable IDs for Diagnosis & Tuning
         const VAR_IS_GPU_BOUND: i32 = 1;
         const VAR_IS_CPU_STUTTER: i32 = 2;
         const VAR_IS_QUEUE_BLOAT: i32 = 3;
         const VAR_IS_UNREACHABLE: i32 = 4;
         const VAR_IS_CADENCE_BAD: i32 = 5;
         const VAR_IS_PERFECT: i32 = 6;
+        const VAR_HAS_BOTTLENECK: i32 = 7;
+        const VAR_RECOMMEND_FIXED: i32 = 8;
+        const VAR_RECOMMEND_VRR: i32 = 9;
 
-        let mut solver = CdclSolver::new(6);
+        let mut solver = CdclSolver::new(9);
         solver.set_vsids_mode(true);
 
-        // Encode diagnostic facts
+        // --- Domain Theory Axioms ---
+        // 1. HAS_BOTTLENECK <=> (GPU_BOUND | CPU_STUTTER | QUEUE_BLOAT | UNREACHABLE | CADENCE_BAD)
+        solver.add_clause(&[-VAR_IS_GPU_BOUND, VAR_HAS_BOTTLENECK]);
+        solver.add_clause(&[-VAR_IS_CPU_STUTTER, VAR_HAS_BOTTLENECK]);
+        solver.add_clause(&[-VAR_IS_QUEUE_BLOAT, VAR_HAS_BOTTLENECK]);
+        solver.add_clause(&[-VAR_IS_UNREACHABLE, VAR_HAS_BOTTLENECK]);
+        solver.add_clause(&[-VAR_IS_CADENCE_BAD, VAR_HAS_BOTTLENECK]);
+        solver.add_clause(&[
+            -VAR_HAS_BOTTLENECK,
+            VAR_IS_GPU_BOUND,
+            VAR_IS_CPU_STUTTER,
+            VAR_IS_QUEUE_BLOAT,
+            VAR_IS_UNREACHABLE,
+            VAR_IS_CADENCE_BAD,
+        ]);
+
+        // 2. PERFECT is mutually exclusive with any bottleneck
+        solver.add_clause(&[-VAR_IS_PERFECT, -VAR_HAS_BOTTLENECK]);
+
+        // 3. Exactly one primary recommended mode
+        solver.add_clause(&[VAR_RECOMMEND_FIXED, VAR_RECOMMEND_VRR]);
+        solver.add_clause(&[-VAR_RECOMMEND_FIXED, -VAR_RECOMMEND_VRR]);
+
+        // Encode empirical diagnostic facts
         let is_gpu_bound = has_off && input.off.jitter_ms < 6.0 && input.off.fps < refresh * 0.95;
         let is_cpu_stutter = (has_off && input.off.jitter_ms > 8.0) || (has_on && input.on.jitter_ms > 10.0);
         let is_queue_bloat = (has_off && input.off.hold_p50_ms > 0.4) || (has_on && input.on.hold_p50_ms > 0.5);
@@ -104,25 +130,25 @@ impl TelemetryTuner {
         assumptions.push(if is_cadence_bad { VAR_IS_CADENCE_BAD } else { -VAR_IS_CADENCE_BAD });
         assumptions.push(if is_perfect { VAR_IS_PERFECT } else { -VAR_IS_PERFECT });
 
-        let _ = solver.solve_with_assumptions(&assumptions, 1000);
+        let _ = solver.solve_with_assumptions(&assumptions, 5000);
 
         let mut diagnoses = Vec::new();
-        if is_unreachable {
+        if solver.get_assignment(VAR_IS_UNREACHABLE).unwrap_or(is_unreachable) {
             diagnoses.push(BottleneckDiagnosis::UnreachableTarget);
         }
-        if is_gpu_bound {
+        if solver.get_assignment(VAR_IS_GPU_BOUND).unwrap_or(is_gpu_bound) {
             diagnoses.push(BottleneckDiagnosis::GpuBound);
         }
-        if is_cpu_stutter {
+        if solver.get_assignment(VAR_IS_CPU_STUTTER).unwrap_or(is_cpu_stutter) {
             diagnoses.push(BottleneckDiagnosis::CpuOrEngineStutter);
         }
-        if is_queue_bloat {
+        if solver.get_assignment(VAR_IS_QUEUE_BLOAT).unwrap_or(is_queue_bloat) {
             diagnoses.push(BottleneckDiagnosis::QueueSaturation);
         }
-        if is_cadence_bad {
+        if solver.get_assignment(VAR_IS_CADENCE_BAD).unwrap_or(is_cadence_bad) {
             diagnoses.push(BottleneckDiagnosis::CadenceMismatch);
         }
-        if is_perfect && diagnoses.is_empty() {
+        if solver.get_assignment(VAR_IS_PERFECT).unwrap_or(is_perfect) && diagnoses.is_empty() {
             diagnoses.push(BottleneckDiagnosis::BalancedPaced);
         }
 
@@ -131,7 +157,7 @@ impl TelemetryTuner {
             144.0, 120.0, 100.0, 90.0, 80.0, 75.0, 72.0, 60.0, 50.0, 48.0, 45.0, 40.0, 36.0, 30.0, 24.0,
         ];
 
-        // Safe throughput cap: 92% of observed base FPS if GPU bound, or 95% otherwise
+        // Safe throughput cap: 92% of observed base FPS if GPU bound, or 96% otherwise
         let max_safe_fps = if is_gpu_bound || is_unreachable {
             effective_base_fps * 0.92
         } else {

@@ -18,14 +18,12 @@ fn main() {
     if cfg!(target_env = "msvc") {
         build
             .flag("/O2")
-            .flag("/arch:AVX2")
             .flag("/fp:fast")
             .flag("/EHsc")
             .define("NDEBUG", None);
     } else {
         build
             .flag("-O3")
-            .flag("-mavx2")
             .flag("-DNDEBUG");
     }
 

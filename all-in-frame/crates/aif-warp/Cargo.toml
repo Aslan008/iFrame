@@ -1,0 +1,9 @@
+[package]
+name = "aif-warp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aif-common = { path = "../aif-common" }
+windows = { workspace = true }

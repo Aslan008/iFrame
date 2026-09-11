@@ -35,6 +35,7 @@ fn l1_contract_profile_toml_roundtrip() {
         vsync_override: false,
         auto_attach: true,
         force_waitable: true,
+        refresh_hz: 165.0,
     };
 
     let serialized = toml::to_string_pretty(&original).expect("serialization must succeed");
@@ -46,6 +47,7 @@ fn l1_contract_profile_toml_roundtrip() {
     assert!(!deserialized.vsync_override);
     assert!(deserialized.auto_attach);
     assert!(deserialized.force_waitable);
+    assert_eq!(deserialized.refresh_hz, 165.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +69,7 @@ fn l2_boundary_partial_toml_uses_defaults() {
     assert!(p.vsync_override);
     assert!(!p.auto_attach);
     assert!(!p.force_waitable);
+    assert_eq!(p.refresh_hz, 0.0, "missing refresh_hz must default to Auto (DWM)");
 }
 
 #[test]

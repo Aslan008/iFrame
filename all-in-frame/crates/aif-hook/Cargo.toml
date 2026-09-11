@@ -1,0 +1,13 @@
+[package]
+name = "aif-hook"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aif-common = { path = "../aif-common" }
+aif-warp = { path = "../aif-warp" }
+windows = { workspace = true }

@@ -848,11 +848,11 @@ mod tests {
     fn vtable_slot_indices_match_real_com_objects() {
         let hwnd = create_hidden_window().expect("dummy window");
         let (device, swapchain) =
-            create_dummy_device_and_swapchain(hwnd).expect("dummy swapchain");
+            unsafe { create_dummy_device_and_swapchain(hwnd) }.expect("dummy swapchain");
 
-        let raw = *(swapchain.as_raw() as *mut *mut *mut c_void);
+        let raw = unsafe { *(swapchain.as_raw() as *mut *mut *mut c_void) };
         let sc2: IDXGISwapChain2 = swapchain.cast().expect("SwapChain2");
-        let vt = unsafe { windows::core::Interface::vtable(&sc2) };
+        let vt = windows::core::Interface::vtable(&sc2);
         let slot = |i: usize| unsafe { core::ptr::read(raw.add(i)) } as usize;
 
         assert_eq!(
@@ -880,8 +880,8 @@ mod tests {
         let adapter = unsafe { dxgi_device.GetAdapter() }.expect("adapter");
         let factory: windows::Win32::Graphics::Dxgi::IDXGIFactory2 =
             unsafe { adapter.GetParent() }.expect("factory");
-        let fraw = *(factory.as_raw() as *mut *mut *mut c_void);
-        let fvt = unsafe { windows::core::Interface::vtable(&factory) };
+        let fraw = unsafe { *(factory.as_raw() as *mut *mut *mut c_void) };
+        let fvt = windows::core::Interface::vtable(&factory);
         let fslot = |i: usize| unsafe { core::ptr::read(fraw.add(i)) } as usize;
 
         assert_eq!(

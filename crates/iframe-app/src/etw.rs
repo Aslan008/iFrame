@@ -127,6 +127,8 @@ pub fn start_watch(pid: u32, state: Arc<SharedState>) -> Result<EtwWatch, String
                         hold_p50_us: 0.0,
                         wait_p50_us: 0.0,
                         has_timing: false,
+                        late: 0,
+                        hold_max_us: 0.0,
                     };
                 }
             }

@@ -13,7 +13,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const SM_MAGIC: u32 = 0x4946524D; // "IFRM"
-pub const SM_VERSION: u32 = 1;
+pub const SM_VERSION: u32 = 2;
 
 /// One paced frame, as recorded by the hook. 48 bytes.
 #[repr(C)]
@@ -125,6 +125,11 @@ impl SharedRing {
         header.tail.store(0, Ordering::Release);
         header.dropped.store(0, Ordering::Release);
         header.hook_state.store(0, Ordering::Release);
+        // Watchdog state MUST be explicitly zeroed: init may be called over
+        // non-zeroed memory (heap alloc in tests), and a garbage host_present
+        // would make the hook read a garbage heartbeat as a dead host.
+        header.host_heartbeat_qpc.store(0, Ordering::Release);
+        header.host_present.store(0, Ordering::Release);
         Some(Self { ptr, len })
     }
 
