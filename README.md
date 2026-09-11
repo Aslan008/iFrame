@@ -1,99 +1,196 @@
-# iFrame — zero-added-latency frame pacer
+# iFrame — Zero-Added-Latency Frame Pacer
 
-A Windows FPS limiter that **adds no input latency** — unlike classical
-limiters (RTSS, in-driver caps), which hold *already finished* frames until
-the target time.
+> **iFrame** — высокоточный ограничитель частоты кадров (FPS limiter) и фреймпейсер для Windows, который **не добавляет задержку ввода** (input lag) в отличие от классических решений (RTSS, встроенные ограничители драйверов), задерживающих уже готовые кадры.
 
-## The core idea: JIT pacing, not frame holding
+---
 
-| | RTSS / driver caps | iFrame |
+> [!WARNING]
+> ### ⚠️ СТАТУС ПРОЕКТА: РАННЕЕ ТЕСТИРОВАНИЕ (ALPHA / EXPERIMENTAL)
+> Приложение находится в стадии **активного тестирования и разработки**. Возможны сбои, нестабильность или индивидуальная несовместимость с нестандартными графическими движками и оверлеями.
+
+> [!CAUTION]
+> ### 🚨 ВАЖНОЕ ПРЕДУПРЕЖДЕНИЕ ОБ АНТИЧИТАХ (DISCLAIMER)
+> - Встроенный механизм защиты и фильтрации процессов/драйверов античитов является **экспериментальным**.
+> - Данная реализация **НЕ ЯВЛЯЕТСЯ фактическим обходом античитов** (не является Anti-Cheat Bypass) и **НЕ ТЕСТИРОВАЛАСЬ** на играх с активными системами защиты (такими как Easy Anti-Cheat, BattlEye, Riot Vanguard, Ricochet, Valve Anti-Cheat и др.).
+> - Инъекция сторонних библиотек (`iframe_hook.dll`) в любые защищённые античитами сетевые игры **КАТЕГОРИЧЕСКИ НЕ РЕКОМЕНДУЕТСЯ** и несёт критический риск получения постоянной блокировки аккаунта (перманентного бана).
+> - **Пользователь несёт единоличную и полную ответственность** за любые последствия использования утилиты с любыми играми и приложениями. Разработчики не несут ответственности за баны, санкции или иной ущерб.
+> - Для сетевых игр со встроенным античитом используйте **исключительно безопасный режим телеметрии ETW** (`iframe watch-etw`), который работает через ядро Windows без инъекции кода в память игры, либо не запускайте iFrame.
+
+---
+
+## 💡 Главная идея: JIT-пейсинг вместо задержки готового кадра
+
+| Характеристика | RTSS / Драйверные лимитеры | iFrame |
 |---|---|---|
-| Where it waits | **After** Present, holding the finished frame | **Before** the next frame starts |
-| What the GPU does | Idles while the frame is held | Already has the frame |
-| Input latency | + up to one frame | **+0** (the frame is submitted the moment it's ready) |
+| **Где происходит ожидание** | **После** `Present`, удерживая уже отрисованный кадр | **До** начала следующего кадра |
+| **Поведение GPU** | Простаивает, пока кадр принудительно задерживается | Обрабатывает кадр сразу по готовности |
+| **Задержка ввода (Input Lag)** | **+ до 1 полного кадра** | **+0 мс** (кадр отдается на дисплей немедленно) |
 
-iFrame hooks the presentation call, lets the real `Present` execute
-immediately, and only then sleeps until the next frame's scheduled start.
-The game thread wakes up with fresh input exactly when the next frame
-should begin. The result: console-smooth frametimes with zero added
-latency.
+iFrame перехватывает вызов отрисовки, позволяет оригинальному `Present` выполниться сразу, и только затем засыпает ровно до запланированного момента старта следующего кадра. В результате игровой цикл просыпается с максимально свежим пользовательским вводом в расчётную фазу кадра.
 
-## Features
+---
 
-- **Zero-latency JIT pacing** — wait after Present, delay only the next
-  frame's start (Bresenham cadence on the display's vblank grid).
-- **DXGI Flip Model support** — factory `CreateSwapChain*` hooks, active
-  swapchain tracking, tearing-aware vsync override, `ResizeBuffers` handling.
-- **x64 + x86** — the injector detects the target's bitness and picks the
-  matching DLL automatically.
-- **Live UI** — frametime graph (10 s), FPS/p50/p99 stats, limiter controls,
-  per-game profiles (`%APPDATA%\iFrame\profiles.toml`), tray icon,
-  global hotkey `Ctrl+Alt+I`, auto-attach.
-- **Anti-cheat safety** — a three-level blacklist (anti-cheat services,
-  loaded modules, known protected games). Protected targets are refused
-  *before any process access* — injection into an anti-cheat game risks a
-  permanent ban.
-- **Telemetry-only ETW mode** — for protected games: observe frame presents
-  via a `Microsoft-Windows-DxgKrnl` real-time trace (the same source
-  PresentMon uses). Zero injection, nothing for an anti-cheat to flag.
-  Requires an elevated process (same as PresentMon).
+## ⚡ Актуальные возможности
 
-## Usage
+### 1. 🚀 JIT Pacing (Just-In-Time)
+- Пейсинг по алгоритму Брезенхэма на сетке кадровой синхронизации (vblank grid) дисплея.
+- Адаптивный запас времени (safety margin) и высокоточный таймер ожидания (`CreateWaitableTimerExW`).
+- Автоматический пропуск (bypass) ожидания при обнаружении упора в GPU (GPU-bound state).
 
-GUI (default):
+### 2. ⚡ Интеграция NVIDIA Reflex SDK
+- **Динамическая загрузка `nvapi64.dll` / `nvapi.dll`**: утилита работает без жесткой привязки к SDK; на видеокартах AMD и Intel автоматически включается безопасный программный fallback.
+- **Режимы работы**: `Off`, `On`, `On + Boost` (доступны в UI и через CLI `--reflex <off|on|boost>`).
+- **Сон на уровне драйвера**: аппаратный вызов `NvAPI_D3D_Sleep` синхронизирован с целевым FPS.
+- **Маркеры задержки**: расстановка меток `PresentStart` и `PresentEnd` для минимизации очереди рендеринга.
+- **Индикация в интерфейсе**: плашка статуса `⚡ Reflex: Sleep/Boost Active` в шапке окна и в оверлее.
 
+### 3. 📊 Внутриигровой D3D11 HUD / Оверлей
+- **Встроенный рендерер**: легкий моноширинный растровый шрифт (5x7) без сторонних библиотек и зависимостей.
+- **График времени кадра (Sparkline)**: динамический график за последние 60 кадров с цветовой градацией задержек.
+- **Метрики в реальном времени**: текущий FPS, расчетный Target, время кадра (мс), перцентили p50 / p99 и джиттер.
+- **Горячая клавиша**: переключение отображения прямо в игре клавишей **`F11`** (`VK_F11`) или чекбоксом в приложении.
+- **Сохранение состояния Direct3D 11**: полное сохранение и восстановление состояний конвейера (OM Render Targets, Viewports, Blend, Depth Stencil, Rasterizer, Shaders, Input Layout, Vertex Buffers).
+- **Корректный ResizeBuffers**: безопасный сброс и пересоздание Render Target View при изменении разрешения или переходе в полный экран.
+
+### 4. 🎨 Совместимость с ReShade (Co-existence)
+- Автоматическое обнаружение цепочек и прокси-библиотек ReShade (`dxgi.dll`, `ReShade64.dll` и др.).
+- Безопасное проксирование и перехват через батуты (trampolines) без конфликтов за хуки `Present`.
+- Отображение статуса сосуществования в панели приложения (`🎨 ReShade: Coexisting`).
+
+### 5. 🎮 Управление геймпадом и режим Handheld (Steam Deck / ROG Ally / Legion Go)
+- **Прямая поддержка XInput**: опрос контроллеров через `xinput1_4.dll` / `xinput1_3.dll` / `xinput9_1_0.dll`.
+- **Защита от микрофризов**: троттлинг опроса отключенных портов (предотвращает задержки в 1-2 мс на системах без подключенного геймпада).
+- **Плавный ввод**: встроенная мертвая зона (deadzone 7849) и автоповтор при удержании стика или крестовины (300 мс задержка, 60 мс повтор).
+- **Режим Big Picture**: увеличение масштаба интерфейса до 1.35x для портативных экранов и ТВ (хоткей `Back` / `L3` или кнопка в шапке).
+
+#### Раскладка управления геймпадом:
+| Кнопка | Действие |
+|---|---|
+| **D-Pad Up / Down** или **Левый стик** | Изменение лимита FPS с шагом ±1 FPS |
+| **D-Pad Left / Right** | Изменение лимита FPS с шагом ±5 FPS |
+| **LB / RB (Бамперы)** | Быстрое переключение пресетов (30, 40, 60, 120 FPS и т.д.) |
+| **Кнопка Y** | Включение / выключение лимитера |
+| **Кнопка A** | Подключение (Attach) к выбранному окну |
+| **Кнопка X** | Включение / выключение автоподключения (Auto-attach) |
+| **Back / View** или **L3 (нажатие левого стика)** | Переключение режима Big Picture (масштаб 1.35x) |
+
+### 6. 📁 Менеджер профилей игр (Profiles Manager)
+- Автоматическое сохранение индивидуальных настроек для каждого процесса в `%APPDATA%\iFrame\profiles.toml`.
+- Вкладка **«Менеджер профилей»** в GUI:
+  - Живой поиск и фильтрация по названию исполняемого файла.
+  - Добавление новых игр вручную или при первой настройке.
+  - Редактирование целевого FPS, режима Reflex, оверлея и VSync для каждого профиля прямо в таблице.
+  - Удаление устаревших профилей в один клик.
+  - **Экспорт и импорт в TOML**: удобный перенос профилей между системами и бэкап настроек.
+
+### 7. 🪟 Поддержка DXGI Flip Model и разрядности x64 / x86
+- Поддержка современных Flip-моделей представления (`CreateSwapChainForHwnd`, `Present1`).
+- Автоматическое определение битности целевого процесса (32-бит / 64-бит) и загрузка соответствующей библиотеки `iframe_hook.dll`.
+
+### 8. 📡 Режим телеметрии через ETW (Event Tracing for Windows)
+- Сбор данных о выводе кадров через провайдер ядра `Microsoft-Windows-DxgKrnl` (аналогично архитектуре PresentMon).
+- Полное отсутствие инъекций в процесс: память игры не модифицируется.
+- *Требует запуска от имени администратора.*
+
+---
+
+## 🛠️ Архитектура проекта
+
+```text
+┌────────────────────────────────────────────────────────┐
+│                      iframe.exe                        │
+│  UI (egui)  │  Game Profiles  │  XInput  │  ETW Watch  │
+└───────────────────────────┬────────────────────────────┘
+                            │ Shared Memory (Ring Buffer + Config)
+┌───────────────────────────▼────────────────────────────┐
+│                    iframe_hook.dll                     │
+│  DXGI / D3D11 Hooks │ JIT Pacer │ Reflex │ D3D11 HUD   │
+└────────────────────────────────────────────────────────┘
 ```
-iframe.exe
+
+- `iframe-common` — математика JIT-пейсинга (алгоритм Брезенхэма, адаптивный запас, проверка GPU-bound), кольцевой буфер телеметрии SPSC в разделяемой памяти, сериализация профилей.
+- `iframe-hook` — внедряемая DLL: перехватчики DXGI/D3D11/D3D9, модуль NVIDIA Reflex (NVAPI), внутриигровой оверлей HUD, высокоточный таймер сна.
+- `iframe-app` — управляющее приложение: интерфейс egui с темами и масштабированием, менеджер профилей, модуль геймпада XInput, инжектор DLL, сборщик ETW-телеметрии.
+- `iframe-solver` — солвер оптимизации кадровых интервалов.
+
+---
+
+## 💻 Использование
+
+### Запуск графического интерфейса (GUI)
+
+```powershell
+.\target\release\iframe.exe
 ```
 
-CLI:
+- **Глобальная горячая клавиша**: `Ctrl+Alt+I` — сворачивание / разворачивание окна управления.
+- **Внутри игры**: клавиша `F11` — скрыть / показать оверлей статистики.
+- Доступно сворачивание в системный трей (System Tray).
 
-```
-iframe.exe inject --window "Game Title"     # inject the hook
-iframe.exe inject --pid 1234                # by PID
-iframe.exe limit --pid 1234 --fps 40        # set the limiter
-iframe.exe limit --pid 1234 --fps 0         # disable
-iframe.exe watch --pid 1234 --seconds 5     # live frametime stats
-iframe.exe watch-etw --pid 1234             # telemetry-only (admin)
-iframe.exe list                             # top-level windows
+### Командная строка (CLI)
+
+```powershell
+# Внедрение хука в окно по заголовку
+iframe.exe inject --window "Название Игры"
+
+# Внедрение хука по PID процесса
+iframe.exe inject --pid 1234
+
+# Установка лимита кадров и режима Reflex
+iframe.exe limit --pid 1234 --fps 60 --reflex boost --overlay
+
+# Отключение лимитера (0 = без ограничений)
+iframe.exe limit --pid 1234 --fps 0
+
+# Мониторинг времени кадров в реальном времени через CLI
+iframe.exe watch --pid 1234 --seconds 10
+
+# Безопасный режим наблюдения через ETW без внедрения (нужен запуск от Администратора)
+iframe.exe watch-etw --pid 1234
+
+# Список всех окон верхнего уровня для подключения
+iframe.exe list
 ```
 
-## Build
+---
 
-```
+## 🔨 Сборка из исходников
+
+Для сборки требуются Rust (инструментарий `msvc`) и поддержка целевых архитектур:
+
+```powershell
+# Добавление таргетов x64 и x86
 rustup target add x86_64-pc-windows-msvc i686-pc-windows-msvc
-cargo build --release                                            # x64 app + DLL
-cargo build --release --target i686-pc-windows-msvc -p iframe-hook  # x86 DLL
+
+# Сборка x64 приложения и DLL хука
+cargo build --release
+
+# Сборка 32-битной (x86) версии хука
+cargo build --release --target i686-pc-windows-msvc -p iframe-hook
 ```
 
-Binaries: `target/release/iframe.exe`, `target/release/iframe_hook.dll`,
-`target/i686-pc-windows-msvc/release/iframe_hook.dll`.
+Готовые исполняемые файлы:
+- `target/release/iframe.exe` — приложение управления
+- `target/release/iframe_hook.dll` — 64-битный хук
+- `target/i686-pc-windows-msvc/release/iframe_hook.dll` — 32-битный хук
 
-## Architecture
-
-```
-┌──────────────┐  shared memory   ┌─────────────────┐
-│  iframe.exe  │◄────────────────►│ iframe_hook.dll │ (injected)
-│  UI/profiles │  ring + config   │  JIT pacer      │
-│  injector    │                  │  Present hooks  │
-│  ETW watch   │                  │  high-res sleep │
-└──────────────┘                  └─────────────────┘
+Запуск тестов всего рабочего пространства:
+```powershell
+cargo test --workspace
 ```
 
-- `iframe-common` — the pacing math (`JitPacer`: Bresenham cadence on the
-  vblank grid, adaptive safety margin, bypass on GPU-bound), the SPSC
-  telemetry ring, the runtime config.
-- `iframe-hook` — the injected DLL: DXGI Present/Present1 + factory hooks,
-  D3D9 chain, the pacing engine, the waitable-timer sleeper.
-- `iframe-app` — the control app: UI, injector, profiles, ETW watcher,
-  anti-cheat gate.
+---
 
-## Known limitations
+## ⚠️ Известные ограничения
 
-- **D3D9**: the hook chain is implemented, but d3d9.dll builds device
-  vtables dynamically and reverts patches (an anti-tamper design) —
-  sustained D3D9 coverage requires inline export hooks (backlog). DXGI
-  (all modern games) is fully supported.
-- **ETW mode**: requires an elevated process.
-- Kernel-level anti-cheat games are never injected — telemetry-only mode
-  only (by design).
+- **Direct3D 9**: базовая цепочка хуков присутствует, однако `d3d9.dll` динамически генерирует и верифицирует таблицы виртуальных методов (vtable), что может приводить к сбросу перехватов. Основной фокус проекта — современные графические API (DirectX 11 / DXGI).
+- **Vulkan / OpenGL**: в текущей тестовой сборке поддержка Vulkan и OpenGL не реализована.
+- **Linux / Proton**: проект разрабатывается и оптимизируется исключительно под платформу Windows.
+- **ETW режим**: требует запуска процесса с правами Администратора для открытия сессии трассировки ядра.
+- **Сетевые игры с античитами**: перехват вызовов в играх с защитой на уровне ядра не поддерживается намеренно.
+
+---
+
+## 📄 Лицензия
+
+Проект распространяется под лицензией MIT.
