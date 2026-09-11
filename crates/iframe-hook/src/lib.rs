@@ -16,6 +16,8 @@
 
 pub mod engine;
 pub mod hooks;
+pub mod overlay;
+pub mod reflex;
 pub mod telemetry;
 pub mod timing;
 pub mod vblank;

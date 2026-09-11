@@ -24,6 +24,8 @@ fn l0_smoke_runtime_config_defaults() {
     assert_eq!(cfg.refresh_hz, 60.0);
     assert!(cfg.vsync_override);
     assert!(!cfg.force_waitable);
+    assert_eq!(cfg.reflex_mode, iframe_common::config::ReflexMode::Off);
+    assert!(!cfg.overlay_enabled);
 }
 
 #[test]
@@ -34,6 +36,8 @@ fn l0_smoke_game_profile_defaults() {
     assert_eq!(prof.mode, PacerMode::FixedVsync);
     assert!(prof.vsync_override);
     assert!(!prof.force_waitable_object);
+    assert_eq!(prof.reflex_mode, iframe_common::config::ReflexMode::Off);
+    assert!(!prof.overlay_enabled);
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +114,8 @@ fn l3_property_runtime_config_equality_and_clone() {
         refresh_hz: 120.0,
         vsync_override: false,
         force_waitable: true,
+        reflex_mode: iframe_common::config::ReflexMode::Boost,
+        overlay_enabled: true,
     };
     let cfg2 = cfg1;
     assert_eq!(cfg1, cfg2);

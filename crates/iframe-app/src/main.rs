@@ -38,7 +38,7 @@ fn main() {
 /// `iframe limit --pid N --fps 40 [--mode vsync|vrr|off] [--refresh HZ]`
 /// Publishes the runtime config into the game's shared header.
 fn cmd_limit(args: &[String]) {
-    use iframe_common::config::RuntimeConfig;
+    use iframe_common::config::{ReflexMode, RuntimeConfig};
     use iframe_common::pacer::PacerMode;
 
     let Some(pid) = arg_value(args, "--pid").and_then(|v| v.parse().ok()) else {
@@ -52,6 +52,20 @@ fn cmd_limit(args: &[String]) {
         _ => PacerMode::FixedVsync,
     };
     let refresh: f64 = arg_value(args, "--refresh").and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let reflex_mode = match arg_value(args, "--reflex").as_deref() {
+        Some("boost") => ReflexMode::Boost,
+        Some("on") => ReflexMode::On,
+        _ => {
+            if args.iter().any(|a| a == "--reflex-boost") {
+                ReflexMode::Boost
+            } else if args.iter().any(|a| a == "--reflex") {
+                ReflexMode::On
+            } else {
+                ReflexMode::Off
+            }
+        }
+    };
+    let overlay_enabled = args.iter().any(|a| a == "--overlay");
     let enabled = fps > 0.0 && mode != PacerMode::Bypass;
 
     let mapping = match sm_host::open(pid) {
@@ -72,6 +86,8 @@ fn cmd_limit(args: &[String]) {
         refresh_hz: refresh,
         vsync_override: !args.iter().any(|a| a == "--no-vsync-override"),
         force_waitable: args.iter().any(|a| a == "--waitable"),
+        reflex_mode,
+        overlay_enabled,
     };
     mapping.ring.set_config(&cfg);
     if enabled {
@@ -383,6 +399,8 @@ fn cmd_tune(args: &[String]) {
         refresh_hz: 0.0,
         vsync_override: false,
         force_waitable: false,
+        reflex_mode: Default::default(),
+        overlay_enabled: false,
     });
     std::thread::sleep(std::time::Duration::from_millis(500));
     let r_off = bench::collect_phase(&mapping.ring, "OFF Baseline", 3, freq);
@@ -395,6 +413,8 @@ fn cmd_tune(args: &[String]) {
         refresh_hz: refresh,
         vsync_override: true,
         force_waitable: false,
+        reflex_mode: Default::default(),
+        overlay_enabled: false,
     });
     std::thread::sleep(std::time::Duration::from_millis(500));
     let r_on = bench::collect_phase(&mapping.ring, "ON Paced", 3, freq);
@@ -448,6 +468,8 @@ fn cmd_tune(args: &[String]) {
                 refresh_hz: refresh,
                 vsync_override: rec.recommended_vsync_override,
                 force_waitable: false,
+                reflex_mode: Default::default(),
+                overlay_enabled: false,
             });
             println!("\n✔ Оптимальный профиль CDCL применён к PID {pid}!");
         }
@@ -468,7 +490,7 @@ fn print_usage() {
     println!("  iframe watch  --pid <N> [--seconds <S>]");
     println!("  iframe watch-etw --pid <N>            (telemetry-only, no injection)");
     println!("  iframe limit  --pid <N> --fps <F> [--mode vsync|vrr|off] [--refresh <Hz>]");
-    println!("                [--no-vsync-override] [--waitable] [--hold]");
+    println!("                [--no-vsync-override] [--waitable] [--reflex <off|on|boost>] [--overlay] [--hold]");
     println!("  iframe tune   --pid <N> [--refresh <Hz>]");
     println!("  iframe bench");
     println!("  iframe solve-cadence   --fps <F> [--refresh <Hz>]");

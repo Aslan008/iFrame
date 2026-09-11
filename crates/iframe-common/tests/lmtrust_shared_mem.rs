@@ -198,6 +198,8 @@ fn l3_property_config_roundtrip_bit_exact() {
             refresh_hz: 120.0,
             vsync_override: true,
             force_waitable: false,
+            reflex_mode: iframe_common::config::ReflexMode::Off,
+            overlay_enabled: false,
         },
         RuntimeConfig {
             enabled: false,
@@ -206,6 +208,8 @@ fn l3_property_config_roundtrip_bit_exact() {
             refresh_hz: 144.0,
             vsync_override: false,
             force_waitable: true,
+            reflex_mode: iframe_common::config::ReflexMode::On,
+            overlay_enabled: true,
         },
         RuntimeConfig {
             enabled: true,
@@ -214,8 +218,11 @@ fn l3_property_config_roundtrip_bit_exact() {
             refresh_hz: 360.0,
             vsync_override: true,
             force_waitable: true,
+            reflex_mode: iframe_common::config::ReflexMode::Boost,
+            overlay_enabled: false,
         },
     ];
+
 
     for cfg in test_configs {
         ring.set_config(&cfg);

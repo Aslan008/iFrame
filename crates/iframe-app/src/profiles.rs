@@ -21,6 +21,16 @@ pub struct GameProfile {
     /// Manual monitor refresh override in Hz (0 = trust the DWM hint).
     #[serde(default)]
     pub refresh_hz: f64,
+    /// NVIDIA Reflex low latency mode: "off" | "on" | "boost"
+    #[serde(default = "default_reflex_mode")]
+    pub reflex_mode: String,
+    /// In-game D3D11 overlay HUD enabled
+    #[serde(default)]
+    pub overlay_enabled: bool,
+}
+
+fn default_reflex_mode() -> String {
+    "off".into()
 }
 
 impl Default for GameProfile {
@@ -32,6 +42,8 @@ impl Default for GameProfile {
             auto_attach: false,
             force_waitable: false,
             refresh_hz: 0.0,
+            reflex_mode: "off".into(),
+            overlay_enabled: false,
         }
     }
 }
@@ -82,6 +94,52 @@ impl Profiles {
         self.flush_due();
     }
 
+    pub fn remove(&mut self, exe: &str) -> bool {
+        if self.games.remove(exe).is_some() {
+            self.dirty = true;
+            self.flush();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn list(&self) -> Vec<(String, GameProfile)> {
+        let mut list: Vec<_> = self
+            .games
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        list.sort_by(|a, b| a.0.cmp(&b.0));
+        list
+    }
+
+    pub fn all_games(&self) -> &HashMap<String, GameProfile> {
+        &self.games
+    }
+
+    /// Export all profiles to a formatted TOML string.
+    pub fn export_toml(&self) -> Result<String, String> {
+        let file = FileFormat {
+            games: self.games.clone(),
+        };
+        toml::to_string_pretty(&file).map_err(|e| format!("Failed to serialize TOML: {e}"))
+    }
+
+    /// Import profiles from a TOML string, merging with existing profiles.
+    /// Returns the number of imported/updated profiles.
+    pub fn import_toml(&mut self, toml_str: &str) -> Result<usize, String> {
+        let parsed: FileFormat =
+            toml::from_str(toml_str).map_err(|e| format!("Failed to parse TOML: {e}"))?;
+        let count = parsed.games.len();
+        for (exe, profile) in parsed.games {
+            self.games.insert(exe, profile);
+        }
+        self.dirty = true;
+        self.flush();
+        Ok(count)
+    }
+
     /// Write pending changes if the debounce interval has elapsed.
     pub fn flush_due(&mut self) {
         if self.dirty && self.last_save.elapsed() >= Duration::from_secs(1) {
@@ -89,7 +147,7 @@ impl Profiles {
         }
     }
 
-    /// Write pending changes now (app shutdown).
+    /// Write pending changes now (app shutdown or profile deletion/import).
     pub fn flush(&mut self) {
         if self.dirty {
             self.save();

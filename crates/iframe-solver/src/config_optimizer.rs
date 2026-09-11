@@ -145,6 +145,8 @@ impl ConfigOptimizer {
             refresh_hz: caps.monitor_refresh_hz,
             vsync_override,
             force_waitable,
+            reflex_mode: Default::default(),
+            overlay_enabled: false,
         })
     }
 }

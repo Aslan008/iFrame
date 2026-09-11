@@ -3,6 +3,7 @@
 pub mod anticheat;
 pub mod bench;
 pub mod etw;
+pub mod gamepad;
 pub mod injector;
 pub mod live;
 pub mod profiles;

@@ -5,3 +5,4 @@ target/
 ui_screenshot*.png
 ui_stderr.txt
 ui_out.txt
+MISSING_FEATURES_vs_Framepacer.md

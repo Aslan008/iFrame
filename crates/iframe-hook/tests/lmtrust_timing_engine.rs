@@ -90,6 +90,8 @@ fn l1_contract_engine_pace_step() {
         refresh_hz: 60.0,
         vsync_override: true,
         force_waitable: false,
+        reflex_mode: Default::default(),
+        overlay_enabled: false,
     };
 
     let freq = qpc_frequency();
@@ -179,6 +181,8 @@ fn l8_temporal_concurrent_pace_calls_do_not_block() {
         refresh_hz: 60.0,
         vsync_override: false,
         force_waitable: false,
+        reflex_mode: Default::default(),
+        overlay_enabled: false,
     };
 
     let cfg_arc = Arc::new(cfg);

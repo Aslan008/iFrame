@@ -13,7 +13,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const SM_MAGIC: u32 = 0x4946524D; // "IFRM"
-pub const SM_VERSION: u32 = 2;
+pub const SM_VERSION: u32 = 3;
 
 /// One paced frame, as recorded by the hook. 48 bytes.
 #[repr(C)]
@@ -70,8 +70,11 @@ pub struct SharedHeader {
     pub mode: AtomicU32,
     pub target_fps_bits: AtomicU64,
     pub refresh_hz_bits: AtomicU64,
+    pub reflex_mode: AtomicU32,
+    pub overlay_enabled: AtomicU32,
     // ---- stats: DLL -> app ----
     pub target_pid: AtomicU32,
+    pub _pad_pid: [u8; 4],
     pub dropped: AtomicU64,
     /// 0 = initialising, 1 = hooks installed, 2 = init failed.
     pub hook_state: AtomicU32,
@@ -79,12 +82,18 @@ pub struct SharedHeader {
     pub vsync_override: AtomicU32,
     /// Per-game opt-in: force FRAME_LATENCY_WAITABLE_OBJECT on new swap chains.
     pub force_waitable: AtomicU32,
+    /// 0 = unavailable, 1 = supported, 2 = active
+    pub reflex_state: AtomicU32,
+    /// 0 = no, 1 = detected
+    pub reshade_detected: AtomicU32,
+    pub _pad_reshade: [u8; 4],
     /// Host heartbeat timestamp in QPC ticks (written by UI/host every ~20ms).
     pub host_heartbeat_qpc: AtomicU64,
     /// 1 if an interactive host/UI is attached and maintaining heartbeats, 0 for CLI one-shot.
     pub host_present: AtomicU32,
-    pub _pad: [u8; 0],
+    pub _pad_tail: [u8; 12],
 }
+
 
 /// Total mapping size for a given record capacity (power of two).
 pub fn total_size(capacity: usize) -> usize {
@@ -170,7 +179,7 @@ impl SharedRing {
         Some(Self { ptr, len })
     }
 
-    fn header(&self) -> &SharedHeader {
+    pub fn header(&self) -> &SharedHeader {
         unsafe { &*(self.ptr as *const SharedHeader) }
     }
 
@@ -264,6 +273,12 @@ impl SharedRing {
         header
             .force_waitable
             .store(cfg.force_waitable as u32, Ordering::Release);
+        header
+            .reflex_mode
+            .store(cfg.reflex_mode.as_u32(), Ordering::Release);
+        header
+            .overlay_enabled
+            .store(cfg.overlay_enabled as u32, Ordering::Release);
     }
 
     pub fn config(&self) -> crate::config::RuntimeConfig {
@@ -275,8 +290,27 @@ impl SharedRing {
             refresh_hz: f64::from_bits(header.refresh_hz_bits.load(Ordering::Acquire)),
             vsync_override: header.vsync_override.load(Ordering::Acquire) != 0,
             force_waitable: header.force_waitable.load(Ordering::Acquire) != 0,
+            reflex_mode: crate::config::ReflexMode::from_u32(header.reflex_mode.load(Ordering::Acquire)),
+            overlay_enabled: header.overlay_enabled.load(Ordering::Acquire) != 0,
         }
     }
+
+    pub fn set_reflex_state(&self, state: u32) {
+        self.header().reflex_state.store(state, Ordering::Release);
+    }
+
+    pub fn reflex_state(&self) -> u32 {
+        self.header().reflex_state.load(Ordering::Acquire)
+    }
+
+    pub fn set_reshade_detected(&self, detected: bool) {
+        self.header().reshade_detected.store(detected as u32, Ordering::Release);
+    }
+
+    pub fn is_reshade_detected(&self) -> bool {
+        self.header().reshade_detected.load(Ordering::Acquire) != 0
+    }
+
 
     pub fn dropped(&self) -> u64 {
         self.header().dropped.load(Ordering::Relaxed)
@@ -444,9 +478,12 @@ mod tests {
                 refresh_hz: 120.0,
                 vsync_override: true,
                 force_waitable: false,
+                reflex_mode: crate::config::ReflexMode::On,
+                overlay_enabled: true,
             };
             ring.set_config(&cfg);
             assert_eq!(ring.config(), cfg);
+
         }
     }
 

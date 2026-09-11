@@ -7,12 +7,20 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
+use crate::gamepad::{GamepadAction, GamepadTracker};
 use crate::live::{SharedState, HISTORY_SECONDS};
 use crate::profiles::{GameProfile, Profiles};
 use crate::sm_host::HostMapping;
 use crate::{anticheat, etw, injector, live, sm_host, tray};
-use iframe_common::config::RuntimeConfig;
+use iframe_common::config::{ReflexMode, RuntimeConfig};
 use iframe_common::pacer::PacerMode;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiTab {
+    #[default]
+    Monitoring,
+    Profiles,
+}
 
 /// Result of the background attach thread.
 enum AttachOutcome {
@@ -76,10 +84,23 @@ pub struct IFrameApp {
     mode: PacerMode,
     vsync_override: bool,
     force_waitable: bool,
+    reflex_mode: ReflexMode,
+    overlay_enabled: bool,
     auto_attach: bool,
     always_on_top: bool,
     applied_on_top: bool,
     window_visible: bool,
+
+    gamepad: GamepadTracker,
+    big_picture_mode: bool,
+    active_tab: UiTab,
+
+    pm_search: String,
+    pm_new_exe: String,
+    pm_export_text: Option<String>,
+    pm_import_text: String,
+    pm_show_import: bool,
+    pm_status: Option<(String, Instant)>,
 
     profiles: Profiles,
     tray: Option<tray::Tray>,
@@ -124,10 +145,21 @@ impl IFrameApp {
             mode: PacerMode::FixedVsync,
             vsync_override: true,
             force_waitable: false,
+            reflex_mode: ReflexMode::Off,
+            overlay_enabled: false,
             auto_attach: false,
             always_on_top: true,
             applied_on_top: false,
             window_visible: true,
+            gamepad: GamepadTracker::new(),
+            big_picture_mode: false,
+            active_tab: UiTab::Monitoring,
+            pm_search: String::new(),
+            pm_new_exe: String::new(),
+            pm_export_text: None,
+            pm_import_text: String::new(),
+            pm_show_import: false,
+            pm_status: None,
             profiles,
             tray: None,  // created lazily on the first ui() frame (see below)
             hotkeys: None,
@@ -248,6 +280,12 @@ impl IFrameApp {
                         self.force_waitable = p.force_waitable;
                         self.auto_attach = p.auto_attach;
                         self.custom_refresh_hz = p.refresh_hz;
+                        self.reflex_mode = match p.reflex_mode.as_str() {
+                            "boost" => ReflexMode::Boost,
+                            "on" => ReflexMode::On,
+                            _ => ReflexMode::Off,
+                        };
+                        self.overlay_enabled = p.overlay_enabled;
                     }
                 }
                 self.state.attached_pid.store(pid, Ordering::Relaxed);
@@ -276,6 +314,8 @@ impl IFrameApp {
                 refresh_hz: 0.0,
                 vsync_override: self.vsync_override,
                 force_waitable: false,
+                reflex_mode: ReflexMode::Off,
+                overlay_enabled: false,
             };
             mapping.ring.set_config(&cfg);
             // No interactive host anymore: clear host_present so the in-game
@@ -302,6 +342,8 @@ impl IFrameApp {
                 refresh_hz: self.custom_refresh_hz, // 0 = the DLL trusts the DWM hint
                 vsync_override: self.vsync_override,
                 force_waitable: self.force_waitable,
+                reflex_mode: self.reflex_mode,
+                overlay_enabled: self.overlay_enabled,
             };
             mapping.ring.set_config(&cfg);
             self.state.limiter_on.store(enabled, Ordering::Relaxed);
@@ -319,6 +361,12 @@ impl IFrameApp {
                         auto_attach: self.auto_attach,
                         force_waitable: self.force_waitable,
                         refresh_hz: self.custom_refresh_hz,
+                        reflex_mode: match self.reflex_mode {
+                            ReflexMode::Off => "off".into(),
+                            ReflexMode::On => "on".into(),
+                            ReflexMode::Boost => "boost".into(),
+                        },
+                        overlay_enabled: self.overlay_enabled,
                     },
                 );
             }
@@ -390,6 +438,59 @@ impl IFrameApp {
         self.windows = enumerate_windows();
         if self.selected_window >= self.windows.len() {
             self.selected_window = 0;
+        }
+    }
+
+    fn poll_gamepad(&mut self, ctx: &egui::Context) {
+        let actions = self.gamepad.poll();
+        for action in actions {
+            match action {
+                GamepadAction::FpsDown(step) => {
+                    self.target_fps = (self.target_fps - step as f64).max(10.0);
+                    self.push_config();
+                }
+                GamepadAction::FpsUp(step) => {
+                    self.target_fps = (self.target_fps + step as f64).min(480.0);
+                    self.push_config();
+                }
+                GamepadAction::PrevPreset => {
+                    let presets = [30.0, 40.0, 60.0, 90.0, 120.0, 144.0, 240.0];
+                    if let Some(pos) = presets.iter().rposition(|&p| p < self.target_fps - 0.5) {
+                        self.target_fps = presets[pos];
+                        self.push_config();
+                    }
+                }
+                GamepadAction::NextPreset => {
+                    let presets = [30.0, 40.0, 60.0, 90.0, 120.0, 144.0, 240.0];
+                    if let Some(pos) = presets.iter().position(|&p| p > self.target_fps + 0.5) {
+                        self.target_fps = presets[pos];
+                        self.push_config();
+                    }
+                }
+                GamepadAction::ToggleLimiter => {
+                    self.toggle_limiter();
+                }
+                GamepadAction::ToggleAutoAttach => {
+                    self.auto_attach = !self.auto_attach;
+                    if let Some(exe) = self.exe_name.clone() {
+                        let mut p = self.profiles.get(&exe).cloned().unwrap_or_default();
+                        p.auto_attach = self.auto_attach;
+                        self.profiles.set(&exe, p);
+                    }
+                }
+                GamepadAction::Attach => {
+                    if !self.attached {
+                        if let Some(pid) = self.windows.get(self.selected_window).map(|(p, _)| *p) {
+                            self.attach(pid);
+                        }
+                    }
+                }
+                GamepadAction::ToggleBigPicture => {
+                    self.big_picture_mode = !self.big_picture_mode;
+                    let zoom = if self.big_picture_mode { 1.35 } else { 1.0 };
+                    ctx.set_zoom_factor(zoom);
+                }
+            }
         }
     }
 
@@ -469,12 +570,268 @@ impl IFrameApp {
             }
         });
     }
+
+    fn show_profile_manager(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("📁 Менеджер профилей игр").heading());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("📋 Экспорт в TOML")
+                    .on_hover_text("Экспортировать все профили в текстовый формат TOML")
+                    .clicked()
+                {
+                    match self.profiles.export_toml() {
+                        Ok(text) => {
+                            ui.ctx().copy_text(text.clone());
+                            self.pm_export_text = Some(text);
+                            self.pm_status = Some((
+                                "✔ Профили скопированы в буфер обмена!".into(),
+                                Instant::now(),
+                            ));
+                        }
+                        Err(e) => {
+                            self.pm_status =
+                                Some((format!("Ошибка экспорта: {e}"), Instant::now()));
+                        }
+                    }
+                }
+                if ui
+                    .button("📥 Импорт из TOML")
+                    .on_hover_text("Импортировать или вставить профили из TOML")
+                    .clicked()
+                {
+                    self.pm_show_import = !self.pm_show_import;
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        if let Some((msg, time)) = &self.pm_status {
+            if time.elapsed() < Duration::from_secs(4) {
+                ui.colored_label(egui::Color32::from_rgb(0x30, 0xE0, 0x6A), msg);
+                ui.add_space(2.0);
+            }
+        }
+
+        if self.pm_show_import {
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Вставьте содержимое TOML для импорта:").strong());
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.pm_import_text)
+                        .desired_rows(6)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("✔ Применить импорт").clicked() {
+                        match self.profiles.import_toml(&self.pm_import_text) {
+                            Ok(count) => {
+                                self.pm_status = Some((
+                                    format!("✔ Успешно импортировано профилей: {count}"),
+                                    Instant::now(),
+                                ));
+                                self.pm_show_import = false;
+                                self.pm_import_text.clear();
+                            }
+                            Err(e) => {
+                                self.pm_status =
+                                    Some((format!("Ошибка импорта: {e}"), Instant::now()));
+                            }
+                        }
+                    }
+                    if ui.button("Отмена").clicked() {
+                        self.pm_show_import = false;
+                    }
+                });
+            });
+            ui.add_space(4.0);
+        }
+
+        let mut close_export = false;
+        if let Some(exp) = &self.pm_export_text {
+            let mut copy_exp = exp.clone();
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Экспортированный TOML (скопирован в буфер):").strong(),
+                    );
+                    if ui.button("✕ Закрыть").clicked() {
+                        close_export = true;
+                    }
+                });
+                ui.add(
+                    egui::TextEdit::multiline(&mut copy_exp)
+                        .desired_rows(6)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY),
+                );
+            });
+            ui.add_space(4.0);
+        }
+        if close_export {
+            self.pm_export_text = None;
+        }
+
+        // Search and Add new profile
+        ui.horizontal(|ui| {
+            ui.label("Поиск:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pm_search).hint_text("Фильтр по имени .exe..."),
+            );
+
+            ui.separator();
+            ui.label("Добавить .exe:");
+            ui.add(egui::TextEdit::singleline(&mut self.pm_new_exe).hint_text("game.exe"));
+            if ui.button("➕ Добавить").clicked() {
+                let trimmed = self.pm_new_exe.trim().to_lowercase();
+                if !trimmed.is_empty() {
+                    let exe = if trimmed.ends_with(".exe") {
+                        trimmed
+                    } else {
+                        format!("{trimmed}.exe")
+                    };
+                    if self.profiles.get(&exe).is_none() {
+                        self.profiles.set(&exe, GameProfile::default());
+                        self.pm_status =
+                            Some((format!("✔ Профиль {exe} добавлен"), Instant::now()));
+                        self.pm_new_exe.clear();
+                    } else {
+                        self.pm_status =
+                            Some((format!("Профиль {exe} уже существует"), Instant::now()));
+                    }
+                }
+            }
+        });
+        ui.add_space(6.0);
+
+        // Profiles list
+        let list = self.profiles.list();
+        let search = self.pm_search.trim().to_lowercase();
+        let mut to_remove: Option<String> = None;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            if list.is_empty() {
+                ui.weak("Нет сохраненных профилей игр.");
+                return;
+            }
+
+            for (exe, mut prof) in list {
+                if !search.is_empty() && !exe.to_lowercase().contains(&search) {
+                    continue;
+                }
+
+                let mut changed = false;
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(&exe).strong());
+                        ui.weak(format!("({:.0} FPS, {})", prof.target_fps, prof.mode));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button("🗑 Удалить")
+                                .on_hover_text("Удалить профиль")
+                                .clicked()
+                            {
+                                to_remove = Some(exe.clone());
+                            }
+                        });
+                    });
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        ui.label("Целевой FPS:");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut prof.target_fps)
+                                    .speed(0.5)
+                                    .range(10.0..=480.0),
+                            )
+                            .changed();
+
+                        ui.label("Режим:");
+                        let mut mode_idx = match prof.mode.as_str() {
+                            "vrr" => 1,
+                            "off" => 2,
+                            _ => 0,
+                        };
+                        egui::ComboBox::from_id_salt(format!("mode_{exe}"))
+                            .selected_text(match mode_idx {
+                                1 => "VRR",
+                                2 => "Выкл",
+                                _ => "ZeroLag (VSync)",
+                            })
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_value(&mut mode_idx, 0, "ZeroLag (VSync)").changed() {
+                                    prof.mode = "vsync".into();
+                                    changed = true;
+                                }
+                                if ui.selectable_value(&mut mode_idx, 1, "VRR").changed() {
+                                    prof.mode = "vrr".into();
+                                    changed = true;
+                                }
+                                if ui.selectable_value(&mut mode_idx, 2, "Выкл").changed() {
+                                    prof.mode = "off".into();
+                                    changed = true;
+                                }
+                            });
+
+                        ui.label("Reflex:");
+                        let mut ref_idx = match prof.reflex_mode.as_str() {
+                            "on" => 1,
+                            "boost" => 2,
+                            _ => 0,
+                        };
+                        egui::ComboBox::from_id_salt(format!("ref_{exe}"))
+                            .selected_text(match ref_idx {
+                                1 => "On",
+                                2 => "On + Boost",
+                                _ => "Off",
+                            })
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_value(&mut ref_idx, 0, "Off").changed() {
+                                    prof.reflex_mode = "off".into();
+                                    changed = true;
+                                }
+                                if ui.selectable_value(&mut ref_idx, 1, "On").changed() {
+                                    prof.reflex_mode = "on".into();
+                                    changed = true;
+                                }
+                                if ui.selectable_value(&mut ref_idx, 2, "On + Boost").changed() {
+                                    prof.reflex_mode = "boost".into();
+                                    changed = true;
+                                }
+                            });
+                    });
+
+                    ui.horizontal(|ui| {
+                        changed |= ui.checkbox(&mut prof.auto_attach, "авто-подключение").changed();
+                        changed |= ui.checkbox(&mut prof.force_waitable, "waitable object").changed();
+                        changed |= ui.checkbox(&mut prof.vsync_override, "override VSync").changed();
+                        changed |= ui.checkbox(&mut prof.overlay_enabled, "HUD [F11]").changed();
+                    });
+                });
+                ui.add_space(3.0);
+
+                if changed {
+                    self.profiles.set(&exe, prof);
+                    if self.exe_name.as_deref() == Some(&exe) {
+                        self.push_config();
+                    }
+                }
+            }
+        });
+
+        if let Some(del_exe) = to_remove {
+            self.profiles.remove(&del_exe);
+            self.pm_status = Some((format!("✔ Профиль {del_exe} удалён"), Instant::now()));
+        }
+    }
 }
 
 impl eframe::App for IFrameApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_tray(ctx);
         self.poll_hotkey();
+        self.poll_gamepad(ctx);
         self.poll_attach();
         self.profiles.flush_due();
         self.auto_scan();
@@ -535,11 +892,60 @@ impl eframe::App for IFrameApp {
                 if let Some(exe) = &self.exe_name {
                     ui.weak(exe);
                 }
+
+                if let Some(m) = &self.mapping {
+                    if m.ring.is_reshade_detected() {
+                        ui.colored_label(egui::Color32::from_rgb(0xDF, 0x70, 0xD8), "🎨 ReShade: Coexisting")
+                            .on_hover_text("ReShade хук обнаружен в цепочке DXGI — безопасная совместимость активна");
+                    }
+                    let r_st = m.ring.reflex_state();
+                    match r_st {
+                        1 => {
+                            ui.colored_label(egui::Color32::from_rgb(0x30, 0xE0, 0x6A), "⚡ Reflex: Sleep Active")
+                                .on_hover_text("Аппаратный NvAPI Reflex Sleep Mode активен — задержка конвейера оптимизирована");
+                        }
+                        2 => {
+                            ui.colored_label(egui::Color32::from_rgb(0x30, 0xE0, 0x6A), "⚡ Reflex: Boost Active")
+                                .on_hover_text("NvAPI Reflex Boost активен — частоты GPU зафиксированы на максимуме");
+                        }
+                        0xFF => {
+                            ui.weak("⚡ Reflex: N/A")
+                                .on_hover_text("Видеокарта не поддерживает NvAPI Reflex или драйвер не NVIDIA");
+                        }
+                        _ => {}
+                    }
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Applied in logic() via the viewport command.
                     ui.toggle_value(&mut self.always_on_top, "📌 поверх всех")
                         .on_hover_text("Закрепить окно iFrame поверх игры");
                 });
+            });
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.active_tab, UiTab::Monitoring, "🎮 Мониторинг и пейсер");
+                ui.selectable_value(&mut self.active_tab, UiTab::Profiles, "📁 Менеджер профилей");
+
+                ui.separator();
+                if self.gamepad.is_connected() {
+                    ui.colored_label(egui::Color32::from_rgb(0x30, 0xE0, 0x6A), "🎮 Геймпад")
+                        .on_hover_text("Геймпад активен: D-pad = FPS, LB/RB = Пресеты, A = Подключить, Y = Вкл/Выкл, Back = Big Picture");
+                } else {
+                    ui.weak("🎮 Геймпад (откл)")
+                        .on_hover_text("Подключите Xbox/XInput контроллер для управления без клавиатуры");
+                }
+
+                if ui
+                    .selectable_label(self.big_picture_mode, "📱 Big Picture")
+                    .on_hover_text("Масштаб 1.35x для портативных ПК (Steam Deck, ROG Ally, Legion Go)")
+                    .clicked()
+                {
+                    self.big_picture_mode = !self.big_picture_mode;
+                    let zoom = if self.big_picture_mode { 1.35 } else { 1.0 };
+                    ui.ctx().set_zoom_factor(zoom);
+                }
             });
         });
 
@@ -552,6 +958,11 @@ impl eframe::App for IFrameApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            if self.active_tab == UiTab::Profiles {
+                self.show_profile_manager(ui);
+                return;
+            }
+
             // --- 1. Graph header bar ---
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("📈 График фреймтайма").strong());
@@ -935,7 +1346,34 @@ impl eframe::App for IFrameApp {
                             {
                                 changed = true;
                             }
+                            if ui
+                                .checkbox(&mut self.overlay_enabled, "HUD в игре [F11]")
+                                .on_hover_text("Компактный аппаратный оверлей поверх DirectX 11 (FPS, фреймтайм, спарклайн, Reflex). F11 переключает в игре.")
+                                .changed()
+                            {
+                                changed = true;
+                            }
                             if changed {
+                                self.push_config();
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("NVIDIA Reflex:");
+                            let mut r_changed = false;
+                            r_changed |= ui
+                                .radio_value(&mut self.reflex_mode, ReflexMode::Off, "Выкл")
+                                .on_hover_text("Аппаратный Reflex отключен")
+                                .changed();
+                            r_changed |= ui
+                                .radio_value(&mut self.reflex_mode, ReflexMode::On, "Вкл (Low Latency)")
+                                .on_hover_text("Включить аппаратный NvAPI Reflex Sleep Mode для устранения очереди кадров")
+                                .changed();
+                            r_changed |= ui
+                                .radio_value(&mut self.reflex_mode, ReflexMode::Boost, "On + Boost")
+                                .on_hover_text("Reflex с поддержанием максимальной тактовой частоты GPU")
+                                .changed();
+                            if r_changed {
                                 self.push_config();
                             }
                         });
@@ -1152,6 +1590,8 @@ impl Drop for IFrameApp {
                 refresh_hz: 0.0,
                 vsync_override: self.vsync_override,
                 force_waitable: false,
+                reflex_mode: ReflexMode::Off,
+                overlay_enabled: false,
             };
             mapping.ring.set_config(&cfg);
             mapping.ring.mark_headless();

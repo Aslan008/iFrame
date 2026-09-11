@@ -18,7 +18,7 @@
 //!   for exclusive fullscreen.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use windows::core::{w, Interface, PCWSTR};
 use windows::Win32::Foundation::{HMODULE, HWND, TRUE};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0};
@@ -213,6 +213,20 @@ pub unsafe fn install() -> Result<(), String> {
     drop(swapchain);
     drop(device);
     let _ = DestroyWindow(hwnd);
+
+    // Detect ReShade presence for cooperative hook chaining
+    let reshade_detected = unsafe {
+        GetModuleHandleW(w!("ReShade64.dll")).is_ok()
+            || GetModuleHandleW(w!("ReShade32.dll")).is_ok()
+            || GetModuleHandleW(w!("ReShade.dll")).is_ok()
+    };
+    if reshade_detected {
+        crate::log_line("ReShade detected in process — chaining hooks cooperatively");
+        if let Some(ring) = telemetry::ring() {
+            ring.set_reshade_detected(true);
+        }
+    }
+
     crate::log_line(
         "dxgi hooks installed (Present@8, ResizeBuffers@13, Present1@22, factory create@10/15/16/24)",
     );
@@ -294,6 +308,71 @@ fn ensure_maximum_frame_latency(this: *mut c_void) {
     }
 }
 
+static LAST_PRESENT_QPC: AtomicU64 = AtomicU64::new(0);
+static SMOOTH_FT_US: AtomicU64 = AtomicU64::new(16666);
+
+#[inline]
+unsafe fn pre_present_hud_and_reflex(this: *mut c_void, cfg: &iframe_common::config::RuntimeConfig) {
+    let reflex = crate::reflex::get();
+    if reflex.is_available() {
+        let sc = std::mem::ManuallyDrop::new(unsafe {
+            std::mem::transmute::<*mut c_void, IDXGISwapChain>(this)
+        });
+        if let Ok(dev) = sc.GetDevice::<ID3D11Device>() {
+            let dev_raw = dev.as_raw();
+            reflex.configure(dev_raw, cfg.reflex_mode, cfg.target_fps);
+            if cfg.reflex_mode != iframe_common::config::ReflexMode::Off {
+                reflex.sleep(dev_raw);
+            }
+            reflex.set_marker(dev_raw, crate::reflex::LatencyMarkerType::PresentStart, 0);
+        }
+    }
+
+    if cfg.overlay_enabled {
+        let now = crate::timing::qpc_now();
+        let prev = LAST_PRESENT_QPC.swap(now as u64, Ordering::Relaxed);
+        let dt_us = if prev > 0 && now as u64 > prev {
+            ((now - prev as i64) as f64 * 1_000_000.0) / crate::timing::qpc_frequency() as f64
+        } else {
+            16666.0
+        };
+        let prev_ema = SMOOTH_FT_US.load(Ordering::Relaxed) as f64;
+        let new_ema = prev_ema * 0.9 + dt_us * 0.1;
+        SMOOTH_FT_US.store(new_ema as u64, Ordering::Relaxed);
+        let ft_ms = new_ema / 1000.0;
+        let fps = if ft_ms > 0.1 { 1000.0 / ft_ms } else { 0.0 };
+
+        let mode_str = match cfg.mode {
+            PacerMode::FixedVsync => "FixedVsync",
+            PacerMode::Vrr => "VRR",
+            PacerMode::Bypass => "Bypass",
+        };
+        let reflex_status = if reflex.is_available() {
+            match cfg.reflex_mode {
+                iframe_common::config::ReflexMode::Off => "Off",
+                iframe_common::config::ReflexMode::On => "On",
+                iframe_common::config::ReflexMode::Boost => "Boost",
+            }
+        } else {
+            "N/A"
+        };
+        crate::overlay::d3d11::render(this, fps, ft_ms, mode_str, reflex_status);
+    }
+}
+
+#[inline]
+unsafe fn post_present_reflex(this: *mut c_void) {
+    let reflex = crate::reflex::get();
+    if reflex.is_available() {
+        let sc = std::mem::ManuallyDrop::new(unsafe {
+            std::mem::transmute::<*mut c_void, IDXGISwapChain>(this)
+        });
+        if let Ok(dev) = sc.GetDevice::<ID3D11Device>() {
+            reflex.set_marker(dev.as_raw(), crate::reflex::LatencyMarkerType::PresentEnd, 0);
+        }
+    }
+}
+
 /// JIT-paced Present: the real Present executes IMMEDIATELY (the frame is
 /// never held); the sleep happens after it, delaying only the START of the
 /// next frame so it completes just-in-time for its target vblank.
@@ -315,12 +394,18 @@ unsafe extern "system" fn hooked_present(this: *mut c_void, sync_interval: u32, 
     } else {
         (sync_interval, flags)
     };
+
+    pre_present_hud_and_reflex(this, &cfg);
+
     let orig = ORIG_PRESENT.load(Ordering::Acquire);
     let hr = if orig.is_null() {
         0x8000_4005u32 as i32 // E_FAIL — trampoline missing, should not happen
     } else {
         (std::mem::transmute::<*mut c_void, PresentFn>(orig))(this, sync, present_flags)
     };
+
+    post_present_reflex(this);
+
     let t_end = crate::timing::qpc_now();
     if pacing {
         let hint = crate::vblank::hint();
@@ -353,6 +438,9 @@ unsafe extern "system" fn hooked_present1(
     } else {
         (sync_interval, flags)
     };
+
+    pre_present_hud_and_reflex(this, &cfg);
+
     let orig = ORIG_PRESENT1.load(Ordering::Acquire);
     let hr = if orig.is_null() {
         0x8000_4005u32 as i32
@@ -364,6 +452,9 @@ unsafe extern "system" fn hooked_present1(
             present_parameters,
         )
     };
+
+    post_present_reflex(this);
+
     let t_end = crate::timing::qpc_now();
     if pacing {
         let hint = crate::vblank::hint();
@@ -422,6 +513,9 @@ unsafe extern "system" fn hooked_resize_buffers(
     format: u32,
     flags: u32,
 ) -> i32 {
+    // Release any cached D3D11 overlay RTV so ResizeBuffers does not fail with DXGI_ERROR_INVALID_CALL
+    crate::overlay::d3d11::on_resize();
+
     let orig = ORIG_RESIZE_BUFFERS.load(Ordering::Acquire);
     // К5: when we forced FRAME_LATENCY_WAITABLE_OBJECT at creation, the game's
     // own ResizeBuffers call without the flag would fail — add it back.
@@ -439,6 +533,7 @@ unsafe extern "system" fn hooked_resize_buffers(
             this, buffer_count, width, height, format, flags,
         )
     };
+
     if hr >= 0 {
         CAPS_VALID.store(false, Ordering::Release);
     }

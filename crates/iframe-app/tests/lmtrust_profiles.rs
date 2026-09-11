@@ -2,12 +2,12 @@
 //!
 //! Layers covered:
 //! - L0 Smoke: GameProfile default construction
-//! - L1 Contract: TOML roundtrip, field serialization
+//! - L1 Contract: TOML roundtrip, field serialization, Profiles import/export
 //! - L2 Boundary: Non-ASCII exe names, spaces, empty strings, missing fields fallback
 //! - L4 Adversarial: Malformed TOML data parsing resilience
 //! - L8 Temporal: Debounce logic (flush_due vs flush)
 
-use iframe_app::profiles::GameProfile;
+use iframe_app::profiles::{GameProfile, Profiles};
 
 // ---------------------------------------------------------------------------
 // L0: Smoke Tests
@@ -21,6 +21,8 @@ fn l0_smoke_game_profile_default() {
     assert!(p.vsync_override);
     assert!(!p.auto_attach);
     assert!(!p.force_waitable);
+    assert_eq!(p.reflex_mode, "off");
+    assert!(!p.overlay_enabled);
 }
 
 // ---------------------------------------------------------------------------
@@ -36,6 +38,8 @@ fn l1_contract_profile_toml_roundtrip() {
         auto_attach: true,
         force_waitable: true,
         refresh_hz: 165.0,
+        reflex_mode: "boost".into(),
+        overlay_enabled: true,
     };
 
     let serialized = toml::to_string_pretty(&original).expect("serialization must succeed");
@@ -48,6 +52,41 @@ fn l1_contract_profile_toml_roundtrip() {
     assert!(deserialized.auto_attach);
     assert!(deserialized.force_waitable);
     assert_eq!(deserialized.refresh_hz, 165.0);
+    assert_eq!(deserialized.reflex_mode, "boost");
+    assert!(deserialized.overlay_enabled);
+}
+
+#[test]
+fn l1_contract_profiles_manager_import_export() {
+    let mut profiles = Profiles::load();
+    let test_exe = "test_game_roundtrip_unit.exe";
+    let prof = GameProfile {
+        target_fps: 120.0,
+        mode: "vsync".into(),
+        vsync_override: true,
+        auto_attach: true,
+        force_waitable: false,
+        refresh_hz: 120.0,
+        reflex_mode: "on".into(),
+        overlay_enabled: true,
+    };
+    profiles.set(test_exe, prof.clone());
+
+    let toml_exported = profiles.export_toml().expect("export_toml must succeed");
+    assert!(toml_exported.contains("test_game_roundtrip_unit.exe"));
+    assert!(toml_exported.contains("reflex_mode = \"on\""));
+    assert!(toml_exported.contains("overlay_enabled = true"));
+
+    let imported_count = profiles.import_toml(&toml_exported).expect("import_toml must succeed");
+    assert!(imported_count >= 1);
+
+    let fetched = profiles.get(test_exe).expect("profile must exist");
+    assert_eq!(fetched.target_fps, 120.0);
+    assert_eq!(fetched.reflex_mode, "on");
+    assert!(fetched.overlay_enabled);
+
+    assert!(profiles.remove(test_exe));
+    assert!(profiles.get(test_exe).is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +109,8 @@ fn l2_boundary_partial_toml_uses_defaults() {
     assert!(!p.auto_attach);
     assert!(!p.force_waitable);
     assert_eq!(p.refresh_hz, 0.0, "missing refresh_hz must default to Auto (DWM)");
+    assert_eq!(p.reflex_mode, "off");
+    assert!(!p.overlay_enabled);
 }
 
 #[test]

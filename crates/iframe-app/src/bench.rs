@@ -225,6 +225,8 @@ pub fn run_benchmark() {
         refresh_hz: 0.0,
         vsync_override: false,
         force_waitable: false,
+        reflex_mode: Default::default(),
+        overlay_enabled: false,
     });
     std::thread::sleep(Duration::from_millis(500));
     let r_off = collect_phase(&mapping.ring, "Limiter OFF (Uncapped)", 4, freq);
@@ -240,6 +242,8 @@ pub fn run_benchmark() {
         refresh_hz: 0.0,
         vsync_override: true,
         force_waitable: false,
+        reflex_mode: Default::default(),
+        overlay_enabled: false,
     });
     std::thread::sleep(Duration::from_millis(500));
     let r_60 = collect_phase(&mapping.ring, "iFrame ZeroLag 60 FPS", 4, freq);
@@ -255,6 +259,8 @@ pub fn run_benchmark() {
         refresh_hz: 0.0,
         vsync_override: true,
         force_waitable: false,
+        reflex_mode: Default::default(),
+        overlay_enabled: false,
     });
     std::thread::sleep(Duration::from_millis(500));
     let r_40 = collect_phase(&mapping.ring, "iFrame VRR 40 FPS", 4, freq);

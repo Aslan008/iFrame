@@ -3,6 +3,30 @@
 
 use crate::pacer::PacerMode;
 
+/// NVIDIA Reflex latency mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum ReflexMode {
+    #[default]
+    Off = 0,
+    On = 1,
+    Boost = 2,
+}
+
+impl ReflexMode {
+    pub fn from_u32(val: u32) -> Self {
+        match val {
+            1 => Self::On,
+            2 => Self::Boost,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
 /// Live settings the control app publishes to the injected hook.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RuntimeConfig {
@@ -18,6 +42,10 @@ pub struct RuntimeConfig {
     /// Per-game opt-in (M4): force `FRAME_LATENCY_WAITABLE_OBJECT` on new
     /// swap chains of this process (hook side, see dxgi.rs).
     pub force_waitable: bool,
+    /// NVIDIA Reflex mode (Off = 0, On = 1, Boost = 2).
+    pub reflex_mode: ReflexMode,
+    /// In-game DXGI/D3D11 overlay HUD toggle.
+    pub overlay_enabled: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -29,6 +57,8 @@ impl Default for RuntimeConfig {
             refresh_hz: 60.0,
             vsync_override: true,
             force_waitable: false,
+            reflex_mode: ReflexMode::Off,
+            overlay_enabled: false,
         }
     }
 }
@@ -45,6 +75,8 @@ pub struct GameProfile {
     /// Force `FRAME_LATENCY_WAITABLE_OBJECT` + `MaxFrameLatency(1)` at swap
     /// chain creation (M4, per-game opt-in, default off).
     pub force_waitable_object: bool,
+    pub reflex_mode: ReflexMode,
+    pub overlay_enabled: bool,
 }
 
 impl Default for GameProfile {
@@ -55,6 +87,8 @@ impl Default for GameProfile {
             mode: PacerMode::FixedVsync,
             vsync_override: true,
             force_waitable_object: false,
+            reflex_mode: ReflexMode::Off,
+            overlay_enabled: false,
         }
     }
-}
+}
