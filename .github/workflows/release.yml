@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name (e.g. v0.1.0-alpha)'
+        required: false
+        default: 'v0.1.0-alpha'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release (Windows x64 + x86)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc, i686-pc-windows-msvc
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build x64 (App + Hook DLL)
+        run: cargo build --release
+
+      - name: Build x86 (32-bit Hook DLL)
+        run: cargo build --release --target i686-pc-windows-msvc -p iframe-hook
+
+      - name: Package Release ZIP
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.inputs.tag_name }}"
+          if (-not $tag) {
+            $tag = "${{ github.ref_name }}"
+          }
+          if (-not $tag -or $tag -eq "master" -or $tag -eq "main") {
+            $tag = "v0.1.0-alpha"
+          }
+
+          $dist = "iFrame-$tag-windows"
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+
+          # Copy 64-bit app and hook DLL
+          Copy-Item "target/release/iframe.exe" -Destination "$dist/iframe.exe"
+          Copy-Item "target/release/iframe_hook.dll" -Destination "$dist/iframe_hook.dll"
+
+          # Copy 32-bit hook DLL (named iframe_hook32.dll for injector auto-resolution)
+          Copy-Item "target/i686-pc-windows-msvc/release/iframe_hook.dll" -Destination "$dist/iframe_hook32.dll"
+
+          # Include documentation
+          if (Test-Path "README.md") {
+            Copy-Item "README.md" -Destination "$dist/README.md"
+          }
+
+          $zipFile = "iFrame-$tag-windows.zip"
+          Compress-Archive -Path "$dist/*" -DestinationPath $zipFile -Force
+
+          Write-Output "Created package: $zipFile"
+          "ZIP_FILE=$zipFile" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_FILE }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: iFrame ${{ env.RELEASE_TAG }} (Early Testing)
+          prerelease: true
+          generate_release_notes: true
